@@ -65,7 +65,7 @@
                 const hlsUrl = loadRequest.media.contentId;
                 console.log(TAG, 'LOAD intercepted:', hlsUrl);
                 const url = new URL(hlsUrl);
-                const wsUrl = 'ws://' + url.hostname + ':8081/stream';
+                const wsUrl = 'ws://' + url.hostname + ':8082/stream';
                 startWebSocketStream(wsUrl);
             } catch (e) {
                 console.error(TAG, 'LOAD intercept error:', e);
