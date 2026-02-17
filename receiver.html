@@ -2,15 +2,18 @@
 <!--
   Custom Cast Web Receiver for Screen Mirroring
   
-  This receiver uses Shaka Player (built into CAF) with aggressive
-  low-latency settings to minimize live streaming delay.
+  Uses WebSocket + Media Source Extensions (MSE) for near-real-time
+  screen mirroring with ~300-500ms latency.
   
-  Setup:
-    1. Host this file on any HTTPS static host (GitHub Pages, Vercel, etc.)
-    2. Register at https://cast.google.com/publish/ ($5 one-time fee)
-    3. Create a "Custom Receiver" app pointing to the hosted URL
-    4. Copy the App ID and set it in the iOS app's Settings
-    5. Wait ~15 minutes for Google to propagate the registration
+  Flow:
+    1. iOS app LAUNCHes this receiver on Chromecast
+    2. iOS app sends START_STREAM message with WebSocket URL
+       OR sends LOAD with HLS URL (WS URL is derived from it)
+    3. Receiver connects to ws://<phone-ip>:8081/stream
+    4. Phone sends fMP4 init segment + fragments over WebSocket
+    5. Receiver feeds them to MSE SourceBuffer for instant playback
+  
+  Host this file on GitHub Pages and register at cast.google.com/publish
 -->
 <html>
 <head>
@@ -18,129 +21,209 @@
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
     <style>
         html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%;
-            height: 100%;
-            background: #000;
-            overflow: hidden;
+            margin: 0; padding: 0;
+            width: 100%; height: 100%;
+            background: #000; overflow: hidden;
         }
-        cast-media-player {
-            --advancement-background-color: transparent;
-            --advancement-text-color: transparent;
-            width: 100%;
-            height: 100%;
+        video { width: 100%; height: 100%; object-fit: contain; }
+        #status {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #fff; font: 24px -apple-system, sans-serif;
+            text-align: center; opacity: 0.8;
+            transition: opacity 0.5s;
         }
     </style>
 </head>
 <body>
-    <cast-media-player></cast-media-player>
+    <div id="status">Waiting for stream...</div>
+    <video id="v" autoplay muted playsinline></video>
     <script>
-        const TAG = '[SMReceiver]';
-        const context = cast.framework.CastReceiverContext.getInstance();
-        const playerManager = context.getPlayerManager();
+    const TAG = '[SMReceiver]';
+    const STREAM_NS = 'urn:x-cast:com.screenmirror.stream';
+    const statusEl = document.getElementById('status');
+    const video = document.getElementById('v');
 
-        // ── Playback configuration with minimum-latency Shaka settings ──
-        const playbackConfig = new cast.framework.PlaybackConfig();
-        playbackConfig.autoResumeDuration = 0;
-        playbackConfig.initialBandwidthEstimate = 3_000_000; // 3 Mbps
+    const ctx = cast.framework.CastReceiverContext.getInstance();
+    const pm = ctx.getPlayerManager();
 
-        // Shaka Player streaming config — aggressively low buffers
-        playbackConfig.shakaConfig = {
-            streaming: {
-                bufferingGoal:              0.5,   // only 0.5 s ahead
-                rebufferingGoal:            0.2,   // start after just 0.2 s
-                bufferBehind:               0,     // discard played data
-                lowLatencyMode:             true,
-                inaccurateManifestTolerance: 0,
-                segmentPrefetchLimit:        2,
-                retryParameters: {
-                    maxAttempts: 10,
-                    baseDelay:  200,
-                    backoffFactor: 1.2,
-                    fuzzFactor: 0.3,
-                },
-            },
-            manifest: {
-                defaultPresentationDelay: 0.5,
-                hls: {
-                    ignoreManifestProgramDateTime: true,
-                },
-                retryParameters: {
-                    maxAttempts: 10,
-                    baseDelay:  200,
-                    backoffFactor: 1.2,
-                    fuzzFactor: 0.3,
-                },
-            },
+    // Listen for stream commands on custom namespace
+    ctx.addCustomMessageListener(STREAM_NS, event => {
+        console.log(TAG, 'Custom message:', event.data);
+        if (event.data.type === 'START_STREAM') {
+            startWebSocketStream(event.data.wsUrl);
+        } else if (event.data.type === 'STOP_STREAM') {
+            stopStream();
+        }
+    });
+
+    // Intercept LOAD as fallback — derive WS URL from HLS URL
+    pm.setMessageInterceptor(
+        cast.framework.messages.MessageType.LOAD,
+        loadRequest => {
+            try {
+                const hlsUrl = loadRequest.media.contentId;
+                console.log(TAG, 'LOAD intercepted:', hlsUrl);
+                const url = new URL(hlsUrl);
+                const wsUrl = 'ws://' + url.hostname + ':8081/stream';
+                startWebSocketStream(wsUrl);
+            } catch (e) {
+                console.error(TAG, 'LOAD intercept error:', e);
+            }
+            return null; // prevent CAF media handling
+        }
+    );
+
+    const opts = new cast.framework.CastReceiverOptions();
+    opts.disableIdleTimeout = true;
+    opts.statusText = 'Screen Mirroring';
+    opts.customNamespaces = {};
+    opts.customNamespaces[STREAM_NS] = cast.framework.system.MessageType.JSON;
+    ctx.start(opts);
+    console.log(TAG, 'Receiver started');
+
+    // ── WebSocket + MSE ──
+
+    let ws = null, mediaSource = null, sourceBuffer = null;
+    let bufferQueue = [], isAppending = false, initReceived = false;
+
+    function startWebSocketStream(wsUrl) {
+        console.log(TAG, 'Connecting to', wsUrl);
+        statusEl.textContent = 'Connecting...';
+        statusEl.style.opacity = '0.8';
+        stopStream();
+
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            console.log(TAG, 'WebSocket connected');
+            statusEl.textContent = 'Buffering...';
         };
 
-        // ── LOAD interceptor — force live-edge start ──
-        playerManager.setMessageInterceptor(
-            cast.framework.messages.MessageType.LOAD,
-            loadRequest => {
-                console.log(TAG, 'LOAD', loadRequest.media.contentId);
-
-                // Always treat as LIVE
-                loadRequest.media.streamType =
-                    cast.framework.messages.StreamType.LIVE;
-
-                // Seek to far future → Shaka snaps to live edge
-                loadRequest.currentTime = 999999;
-
-                // Tell CAF about HLS TS segments
-                loadRequest.media.hlsSegmentFormat =
-                    cast.framework.messages.HlsSegmentFormat.TS;
-
-                return loadRequest;
+        ws.onmessage = (event) => {
+            const data = new Uint8Array(event.data);
+            if (!initReceived) {
+                initReceived = true;
+                console.log(TAG, 'Init segment:', data.length, 'bytes');
+                initMSE(data);
+                return;
             }
-        );
+            appendToBuffer(data);
+        };
 
-        // ── Periodic live-edge sync ──
-        // If playback drifts behind the live edge, snap forward.
-        playerManager.addEventListener(
-            cast.framework.events.EventType.TIME_UPDATE,
-            () => {
-                try {
-                    const player = playerManager.getMediaInformation();
-                    if (!player) return;
+        ws.onerror = (e) => {
+            console.error(TAG, 'WS error:', e);
+            statusEl.textContent = 'Connection error';
+            statusEl.style.opacity = '0.8';
+        };
 
-                    const video = playerManager.getMediaElement();
-                    if (!video || video.paused) return;
+        ws.onclose = () => {
+            console.log(TAG, 'WS closed, reconnecting in 1s...');
+            setTimeout(() => {
+                if (ws && ws.readyState === WebSocket.CLOSED) {
+                    startWebSocketStream(wsUrl);
+                }
+            }, 1000);
+        };
+    }
 
-                    const seekable = video.seekable;
-                    if (seekable.length === 0) return;
+    function stopStream() {
+        if (ws) { ws.onclose = null; ws.close(); ws = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(e) {}
+        }
+        mediaSource = null; sourceBuffer = null;
+        bufferQueue = []; isAppending = false; initReceived = false;
+    }
 
-                    const liveEdge = seekable.end(seekable.length - 1);
-                    const behind   = liveEdge - video.currentTime;
+    function initMSE(initSeg) {
+        mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
 
-                    // If more than 1.5 s behind live, snap forward
-                    if (behind > 1.5) {
-                        console.log(TAG, `Behind by ${behind.toFixed(1)}s → snapping to live edge`);
-                        video.currentTime = liveEdge - 0.2;
-                    }
-                } catch (e) {
-                    // ignore
+        mediaSource.addEventListener('sourceopen', () => {
+            const codec = detectCodec(initSeg) || 'avc1.640029';
+            console.log(TAG, 'Codec:', codec);
+
+            try {
+                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+            } catch (e) {
+                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+            }
+
+            sourceBuffer.mode = 'sequence';
+            sourceBuffer.addEventListener('updateend', () => {
+                isAppending = false;
+                drainQueue();
+                tryPlay();
+            });
+
+            appendToBuffer(initSeg);
+        });
+    }
+
+    function appendToBuffer(data) {
+        bufferQueue.push(data);
+        drainQueue();
+    }
+
+    function drainQueue() {
+        if (isAppending || !sourceBuffer || bufferQueue.length === 0) return;
+        if (sourceBuffer.updating) return;
+        isAppending = true;
+        const chunk = bufferQueue.shift();
+        try {
+            sourceBuffer.appendBuffer(chunk);
+        } catch (e) {
+            console.error(TAG, 'appendBuffer error:', e.name);
+            isAppending = false;
+            if (e.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
+                try { sourceBuffer.remove(sourceBuffer.buffered.start(0), sourceBuffer.buffered.end(0) - 1); }
+                catch(re) {}
+            }
+        }
+    }
+
+    let hasPlayed = false;
+    function tryPlay() {
+        if (video.paused && sourceBuffer && sourceBuffer.buffered.length > 0) {
+            video.play().then(() => {
+                if (!hasPlayed) {
+                    hasPlayed = true;
+                    console.log(TAG, 'Playing');
+                    statusEl.style.opacity = '0';
+                }
+            }).catch(() => {});
+        }
+        // Trim old data
+        if (sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
+            const trimEnd = video.currentTime - 2;
+            if (trimEnd > sourceBuffer.buffered.start(0)) {
+                try { sourceBuffer.remove(sourceBuffer.buffered.start(0), trimEnd); } catch(e) {}
+            }
+        }
+    }
+
+    // Snap to live edge if drifting
+    setInterval(() => {
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 1.0) {
+            video.currentTime = edge - 0.05;
+        }
+    }, 500);
+
+    function detectCodec(initSeg) {
+        for (let i = 0; i < initSeg.length - 8; i++) {
+            if (initSeg[i]===0x61 && initSeg[i+1]===0x76 && initSeg[i+2]===0x63 && initSeg[i+3]===0x43) {
+                if (initSeg[i+4] === 1 && i+7 < initSeg.length) {
+                    const h = n => n.toString(16).padStart(2,'0');
+                    return 'avc1.' + h(initSeg[i+5]) + h(initSeg[i+6]) + h(initSeg[i+7]);
                 }
             }
-        );
-
-        // ── Error handling — auto-retry on errors ──
-        playerManager.addEventListener(
-            cast.framework.events.EventType.ERROR,
-            event => {
-                console.error(TAG, 'Error:', event.detailedErrorCode, event.error);
-            }
-        );
-
-        // ── Start the receiver ──
-        const options = new cast.framework.CastReceiverOptions();
-        options.disableIdleTimeout  = true;
-        options.statusText          = 'Screen Mirroring';
-        options.playbackConfig      = playbackConfig;
-
-        context.start(options);
-        console.log(TAG, 'Receiver started');
+        }
+        return null;
+    }
     </script>
 </body>
 </html>
