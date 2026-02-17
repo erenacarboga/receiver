@@ -1,9 +1,4 @@
 <!DOCTYPE html>
-<!--
-  Custom Cast Web Receiver for Screen Mirroring
-  WebSocket + fMP4 + MSE for near-real-time screen mirroring.
-  v2 — segments mode, diagnostics, robust error handling.
--->
 <html>
 <head>
     <meta charset="utf-8">
@@ -48,7 +43,6 @@
     const pm = ctx.getPlayerManager();
     let senderBusId = null;
 
-    // Send diagnostic message back to iOS app
     function report(msg) {
         console.log(TAG, msg);
         if (senderBusId) {
@@ -58,7 +52,6 @@
         }
     }
 
-    // Listen for stream commands on custom namespace
     ctx.addCustomMessageListener(NS, event => {
         senderBusId = event.senderId;
         console.log(TAG, 'Custom message from', event.senderId, ':', JSON.stringify(event.data));
@@ -73,7 +66,6 @@
         }
     });
 
-    // Intercept LOAD as fallback — derive WS URL from HLS URL
     pm.setMessageInterceptor(
         cast.framework.messages.MessageType.LOAD,
         loadRequest => {
@@ -98,8 +90,6 @@
     ctx.start(opts);
     console.log(TAG, 'Receiver v2 started');
 
-    // ── WebSocket + MSE ──
-
     let ws = null, mediaSource = null, sourceBuffer = null;
     let bufferQueue = [], isAppending = false, initReceived = false;
     let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
@@ -114,7 +104,6 @@
     }
 
     function reinitMSE(initSeg) {
-        // Resolution changed mid-stream — tear down old MSE and create fresh one
         if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
             try { mediaSource.endOfStream(); } catch(e) {}
@@ -149,8 +138,6 @@
                 initMSE(data);
                 return;
             }
-            // Detect mid-stream init segment (orientation/resolution change)
-            // fMP4 init segments start with an ftyp box: bytes 4-7 = 'ftyp'
             if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
                 report('Re-init segment (resolution change): ' + data.length + ' bytes');
                 reinitMSE(data);
@@ -209,7 +196,6 @@
                 }
             }
 
-            // Use segments mode (default) — timestamps from moof/tfdt are used
             sourceBuffer.addEventListener('updateend', onUpdateEnd);
             sourceBuffer.addEventListener('error', (e) => {
                 report('SourceBuffer error event');
@@ -217,15 +203,11 @@
                 bufferQueue = [];
             });
 
-            // Append init segment FIRST — must be before any fragments
-            // that may have arrived via WebSocket before sourceopen fired
             bufferQueue.unshift(initSeg);
             drainQueue();
 
-            // Start play retry timer
             playRetryTimer = setInterval(() => {
                 tryPlay();
-                // Report status periodically
                 if (sourceBuffer && !hasPlayed) {
                     const bl = sourceBuffer.buffered.length;
                     const vp = video.paused;
@@ -297,7 +279,6 @@
                 report('play() rejected: ' + e.name + ' ' + e.message);
             });
         }
-        // Trim old data when playing
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
             const trimEnd = video.currentTime - 3;
             if (trimEnd > sourceBuffer.buffered.start(0)) {
@@ -306,7 +287,6 @@
         }
     }
 
-    // Snap to live edge if drifting
     setInterval(() => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
@@ -315,7 +295,6 @@
         }
     }, 500);
 
-    // Video event monitoring
     video.addEventListener('error', (e) => {
         const err = video.error;
         report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
