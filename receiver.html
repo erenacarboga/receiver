@@ -113,6 +113,18 @@
         statusEl.style.opacity = '0';
     }
 
+    function reinitMSE(initSeg) {
+        // Resolution changed mid-stream — tear down old MSE and create fresh one
+        if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(e) {}
+        }
+        mediaSource = null; sourceBuffer = null;
+        bufferQueue = []; isAppending = false;
+        hasPlayed = false; appendCount = 0; fatalError = false;
+        initMSE(initSeg);
+    }
+
     function startWebSocketStream(wsUrl) {
         welcomeImg.style.display = 'none';
         video.style.display = 'block';
@@ -135,6 +147,13 @@
                 initReceived = true;
                 report('Init segment: ' + data.length + ' bytes');
                 initMSE(data);
+                return;
+            }
+            // Detect mid-stream init segment (orientation/resolution change)
+            // fMP4 init segments start with an ftyp box: bytes 4-7 = 'ftyp'
+            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+                report('Re-init segment (resolution change): ' + data.length + ' bytes');
+                reinitMSE(data);
                 return;
             }
             appendToBuffer(data);
