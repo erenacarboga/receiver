@@ -297,6 +297,13 @@
     }, 500);
 
     // Video event monitoring
+    video.addEventListener('resize', () => {
+        report('video resize: ' + video.videoWidth + 'x' + video.videoHeight);
+        // Force layout update if needed
+        video.style.display = 'none';
+        video.offsetHeight; // trigger reflow
+        video.style.display = 'block';
+    });
     video.addEventListener('error', (e) => {
         const err = video.error;
         report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
