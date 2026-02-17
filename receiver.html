@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<!--
+  Custom Cast Web Receiver for Screen Mirroring
+  
+  This receiver uses Shaka Player (built into CAF) with aggressive
+  low-latency settings to minimize live streaming delay.
+  
+  Setup:
+    1. Host this file on any HTTPS static host (GitHub Pages, Vercel, etc.)
+    2. Register at https://cast.google.com/publish/ ($5 one-time fee)
+    3. Create a "Custom Receiver" app pointing to the hosted URL
+    4. Copy the App ID and set it in the iOS app's Settings
+    5. Wait ~15 minutes for Google to propagate the registration
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }
+        cast-media-player {
+            --advancement-background-color: transparent;
+            --advancement-text-color: transparent;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+    <cast-media-player></cast-media-player>
+    <script>
+        const TAG = '[SMReceiver]';
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
+
+        // ── Playback configuration with minimum-latency Shaka settings ──
+        const playbackConfig = new cast.framework.PlaybackConfig();
+        playbackConfig.autoResumeDuration = 0;
+        playbackConfig.initialBandwidthEstimate = 3_000_000; // 3 Mbps
+
+        // Shaka Player streaming config — aggressively low buffers
+        playbackConfig.shakaConfig = {
+            streaming: {
+                bufferingGoal:              0.5,   // only 0.5 s ahead
+                rebufferingGoal:            0.2,   // start after just 0.2 s
+                bufferBehind:               0,     // discard played data
+                lowLatencyMode:             true,
+                inaccurateManifestTolerance: 0,
+                segmentPrefetchLimit:        2,
+                retryParameters: {
+                    maxAttempts: 10,
+                    baseDelay:  200,
+                    backoffFactor: 1.2,
+                    fuzzFactor: 0.3,
+                },
+            },
+            manifest: {
+                defaultPresentationDelay: 0.5,
+                hls: {
+                    ignoreManifestProgramDateTime: true,
+                },
+                retryParameters: {
+                    maxAttempts: 10,
+                    baseDelay:  200,
+                    backoffFactor: 1.2,
+                    fuzzFactor: 0.3,
+                },
+            },
+        };
+
+        // ── LOAD interceptor — force live-edge start ──
+        playerManager.setMessageInterceptor(
+            cast.framework.messages.MessageType.LOAD,
+            loadRequest => {
+                console.log(TAG, 'LOAD', loadRequest.media.contentId);
+
+                // Always treat as LIVE
+                loadRequest.media.streamType =
+                    cast.framework.messages.StreamType.LIVE;
+
+                // Seek to far future → Shaka snaps to live edge
+                loadRequest.currentTime = 999999;
+
+                // Tell CAF about HLS TS segments
+                loadRequest.media.hlsSegmentFormat =
+                    cast.framework.messages.HlsSegmentFormat.TS;
+
+                return loadRequest;
+            }
+        );
+
+        // ── Periodic live-edge sync ──
+        // If playback drifts behind the live edge, snap forward.
+        playerManager.addEventListener(
+            cast.framework.events.EventType.TIME_UPDATE,
+            () => {
+                try {
+                    const player = playerManager.getMediaInformation();
+                    if (!player) return;
+
+                    const video = playerManager.getMediaElement();
+                    if (!video || video.paused) return;
+
+                    const seekable = video.seekable;
+                    if (seekable.length === 0) return;
+
+                    const liveEdge = seekable.end(seekable.length - 1);
+                    const behind   = liveEdge - video.currentTime;
+
+                    // If more than 1.5 s behind live, snap forward
+                    if (behind > 1.5) {
+                        console.log(TAG, `Behind by ${behind.toFixed(1)}s → snapping to live edge`);
+                        video.currentTime = liveEdge - 0.2;
+                    }
+                } catch (e) {
+                    // ignore
+                }
+            }
+        );
+
+        // ── Error handling — auto-retry on errors ──
+        playerManager.addEventListener(
+            cast.framework.events.EventType.ERROR,
+            event => {
+                console.error(TAG, 'Error:', event.detailedErrorCode, event.error);
+            }
+        );
+
+        // ── Start the receiver ──
+        const options = new cast.framework.CastReceiverOptions();
+        options.disableIdleTimeout  = true;
+        options.statusText          = 'Screen Mirroring';
+        options.playbackConfig      = playbackConfig;
+
+        context.start(options);
+        console.log(TAG, 'Receiver started');
+    </script>
+</body>
+</html>
