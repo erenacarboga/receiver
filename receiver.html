@@ -90,7 +90,7 @@
     let ws = null, mediaSource = null, sourceBuffer = null;
     let bufferQueue = [], isAppending = false, initReceived = false;
     let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
-    let playRetryTimer = null;
+    let playRetryTimer = null, fatalError = false;
 
     function startWebSocketStream(wsUrl) {
         report('Connecting to ' + wsUrl);
@@ -142,7 +142,7 @@
         }
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false; initReceived = false;
-        hasPlayed = false; appendCount = 0; firstFragmentDTS = -1;
+        hasPlayed = false; appendCount = 0; firstFragmentDTS = -1; fatalError = false;
     }
 
     function initMSE(initSeg) {
@@ -171,6 +171,8 @@
             sourceBuffer.addEventListener('updateend', onUpdateEnd);
             sourceBuffer.addEventListener('error', (e) => {
                 report('SourceBuffer error event');
+                fatalError = true;
+                bufferQueue = [];
             });
 
             // Append init segment
@@ -218,7 +220,7 @@
     }
 
     function drainQueue() {
-        if (isAppending || !sourceBuffer || bufferQueue.length === 0) return;
+        if (fatalError || isAppending || !sourceBuffer || bufferQueue.length === 0) return;
         if (sourceBuffer.updating) return;
         isAppending = true;
         const chunk = bufferQueue.shift();
@@ -273,6 +275,8 @@
     video.addEventListener('error', (e) => {
         const err = video.error;
         report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
+        fatalError = true;
+        bufferQueue = [];
     });
     video.addEventListener('waiting', () => { if (hasPlayed) report('video waiting'); });
     video.addEventListener('stalled', () => report('video stalled'));
