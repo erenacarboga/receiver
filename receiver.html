@@ -1,19 +1,8 @@
 <!DOCTYPE html>
 <!--
   Custom Cast Web Receiver for Screen Mirroring
-  
-  Uses WebSocket + Media Source Extensions (MSE) for near-real-time
-  screen mirroring with ~300-500ms latency.
-  
-  Flow:
-    1. iOS app LAUNCHes this receiver on Chromecast
-    2. iOS app sends START_STREAM message with WebSocket URL
-       OR sends LOAD with HLS URL (WS URL is derived from it)
-    3. Receiver connects to ws://<phone-ip>:8081/stream
-    4. Phone sends fMP4 init segment + fragments over WebSocket
-    5. Receiver feeds them to MSE SourceBuffer for instant playback
-  
-  Host this file on GitHub Pages and register at cast.google.com/publish
+  WebSocket + fMP4 + MSE for near-real-time screen mirroring.
+  v2 — segments mode, diagnostics, robust error handling.
 -->
 <html>
 <head>
@@ -25,13 +14,14 @@
             width: 100%; height: 100%;
             background: #000; overflow: hidden;
         }
-        video { width: 100%; height: 100%; object-fit: contain; }
+        video { width: 100%; height: 100%; object-fit: contain; background: #000; }
         #status {
             position: fixed; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
             color: #fff; font: 24px -apple-system, sans-serif;
             text-align: center; opacity: 0.8;
             transition: opacity 0.5s;
+            z-index: 10;
         }
     </style>
 </head>
@@ -40,17 +30,30 @@
     <video id="v" autoplay muted playsinline></video>
     <script>
     const TAG = '[SMReceiver]';
-    const STREAM_NS = 'urn:x-cast:com.screenmirror.stream';
+    const NS = 'urn:x-cast:com.screenmirror.stream';
     const statusEl = document.getElementById('status');
     const video = document.getElementById('v');
 
     const ctx = cast.framework.CastReceiverContext.getInstance();
     const pm = ctx.getPlayerManager();
+    let senderBusId = null;
+
+    // Send diagnostic message back to iOS app
+    function report(msg) {
+        console.log(TAG, msg);
+        if (senderBusId) {
+            try {
+                ctx.sendCustomMessage(NS, senderBusId, {type: 'DIAG', msg: msg});
+            } catch(e) {}
+        }
+    }
 
     // Listen for stream commands on custom namespace
-    ctx.addCustomMessageListener(STREAM_NS, event => {
-        console.log(TAG, 'Custom message:', event.data);
+    ctx.addCustomMessageListener(NS, event => {
+        senderBusId = event.senderId;
+        console.log(TAG, 'Custom message from', event.senderId, ':', JSON.stringify(event.data));
         if (event.data.type === 'START_STREAM') {
+            report('START_STREAM received: ' + event.data.wsUrl);
             startWebSocketStream(event.data.wsUrl);
         } else if (event.data.type === 'STOP_STREAM') {
             stopStream();
@@ -63,14 +66,14 @@
         loadRequest => {
             try {
                 const hlsUrl = loadRequest.media.contentId;
-                console.log(TAG, 'LOAD intercepted:', hlsUrl);
+                report('LOAD intercepted: ' + hlsUrl);
                 const url = new URL(hlsUrl);
                 const wsUrl = 'ws://' + url.hostname + ':8082/stream';
                 startWebSocketStream(wsUrl);
             } catch (e) {
-                console.error(TAG, 'LOAD intercept error:', e);
+                report('LOAD intercept error: ' + e.message);
             }
-            return null; // prevent CAF media handling
+            return null;
         }
     );
 
@@ -78,17 +81,19 @@
     opts.disableIdleTimeout = true;
     opts.statusText = 'Screen Mirroring';
     opts.customNamespaces = {};
-    opts.customNamespaces[STREAM_NS] = cast.framework.system.MessageType.JSON;
+    opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    console.log(TAG, 'Receiver started');
+    console.log(TAG, 'Receiver v2 started');
 
     // ── WebSocket + MSE ──
 
     let ws = null, mediaSource = null, sourceBuffer = null;
     let bufferQueue = [], isAppending = false, initReceived = false;
+    let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
+    let playRetryTimer = null;
 
     function startWebSocketStream(wsUrl) {
-        console.log(TAG, 'Connecting to', wsUrl);
+        report('Connecting to ' + wsUrl);
         statusEl.textContent = 'Connecting...';
         statusEl.style.opacity = '0.8';
         stopStream();
@@ -97,7 +102,7 @@
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = () => {
-            console.log(TAG, 'WebSocket connected');
+            report('WebSocket connected');
             statusEl.textContent = 'Buffering...';
         };
 
@@ -105,7 +110,7 @@
             const data = new Uint8Array(event.data);
             if (!initReceived) {
                 initReceived = true;
-                console.log(TAG, 'Init segment:', data.length, 'bytes');
+                report('Init segment: ' + data.length + ' bytes');
                 initMSE(data);
                 return;
             }
@@ -113,15 +118,16 @@
         };
 
         ws.onerror = (e) => {
-            console.error(TAG, 'WS error:', e);
+            report('WS error');
             statusEl.textContent = 'Connection error';
             statusEl.style.opacity = '0.8';
         };
 
         ws.onclose = () => {
-            console.log(TAG, 'WS closed, reconnecting in 1s...');
+            report('WS closed, reconnecting...');
             setTimeout(() => {
                 if (ws && ws.readyState === WebSocket.CLOSED) {
+                    initReceived = false;
                     startWebSocketStream(wsUrl);
                 }
             }, 1000);
@@ -129,37 +135,81 @@
     }
 
     function stopStream() {
+        if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
         if (ws) { ws.onclose = null; ws.close(); ws = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
             try { mediaSource.endOfStream(); } catch(e) {}
         }
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false; initReceived = false;
+        hasPlayed = false; appendCount = 0; firstFragmentDTS = -1;
     }
 
     function initMSE(initSeg) {
         mediaSource = new MediaSource();
-        video.src = URL.createObjectURL(mediaSource);
 
         mediaSource.addEventListener('sourceopen', () => {
+            report('MSE sourceopen');
             const codec = detectCodec(initSeg) || 'avc1.640029';
-            console.log(TAG, 'Codec:', codec);
+            report('Codec: ' + codec);
 
             try {
                 sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+                report('SourceBuffer created OK');
             } catch (e) {
-                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                report('addSourceBuffer failed with ' + codec + ': ' + e.message);
+                try {
+                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                    report('Fallback SourceBuffer created (Baseline)');
+                } catch (e2) {
+                    report('Fallback addSourceBuffer also failed: ' + e2.message);
+                    return;
+                }
             }
 
-            sourceBuffer.mode = 'sequence';
-            sourceBuffer.addEventListener('updateend', () => {
-                isAppending = false;
-                drainQueue();
-                tryPlay();
+            // Use segments mode (default) — timestamps from moof/tfdt are used
+            sourceBuffer.addEventListener('updateend', onUpdateEnd);
+            sourceBuffer.addEventListener('error', (e) => {
+                report('SourceBuffer error event');
             });
 
+            // Append init segment
             appendToBuffer(initSeg);
+
+            // Start play retry timer
+            playRetryTimer = setInterval(() => {
+                tryPlay();
+                // Report status periodically
+                if (sourceBuffer && !hasPlayed) {
+                    const bl = sourceBuffer.buffered.length;
+                    const vp = video.paused;
+                    const ct = video.currentTime.toFixed(2);
+                    const re = video.readyState;
+                    report('status: buffered=' + bl + ' paused=' + vp + ' time=' + ct + ' readyState=' + re + ' appends=' + appendCount + ' qLen=' + bufferQueue.length);
+                }
+            }, 1000);
         });
+
+        mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
+        mediaSource.addEventListener('sourceclose', () => report('MSE sourceclose'));
+
+        video.src = URL.createObjectURL(mediaSource);
+        report('video.src set, waiting for sourceopen...');
+    }
+
+    function onUpdateEnd() {
+        isAppending = false;
+        appendCount++;
+        if (appendCount <= 3) {
+            const bl = sourceBuffer.buffered.length;
+            let info = 'updateend #' + appendCount + ' buffered.length=' + bl;
+            if (bl > 0) {
+                info += ' range=[' + sourceBuffer.buffered.start(0).toFixed(3) + ',' + sourceBuffer.buffered.end(0).toFixed(3) + ']';
+            }
+            report(info);
+        }
+        drainQueue();
+        tryPlay();
     }
 
     function appendToBuffer(data) {
@@ -175,29 +225,35 @@
         try {
             sourceBuffer.appendBuffer(chunk);
         } catch (e) {
-            console.error(TAG, 'appendBuffer error:', e.name);
+            report('appendBuffer error: ' + e.name + ' ' + e.message);
             isAppending = false;
             if (e.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
-                try { sourceBuffer.remove(sourceBuffer.buffered.start(0), sourceBuffer.buffered.end(0) - 1); }
-                catch(re) {}
+                try {
+                    sourceBuffer.remove(0, sourceBuffer.buffered.end(0) - 1);
+                } catch(re) {}
             }
         }
     }
 
-    let hasPlayed = false;
     function tryPlay() {
-        if (video.paused && sourceBuffer && sourceBuffer.buffered.length > 0) {
+        if (!sourceBuffer) return;
+        if (video.paused && sourceBuffer.buffered.length > 0) {
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            video.currentTime = Math.max(0, edge - 0.1);
             video.play().then(() => {
                 if (!hasPlayed) {
                     hasPlayed = true;
-                    console.log(TAG, 'Playing');
+                    report('PLAYING! time=' + video.currentTime.toFixed(2));
                     statusEl.style.opacity = '0';
+                    if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
                 }
-            }).catch(() => {});
+            }).catch((e) => {
+                report('play() rejected: ' + e.name + ' ' + e.message);
+            });
         }
-        // Trim old data
-        if (sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
-            const trimEnd = video.currentTime - 2;
+        // Trim old data when playing
+        if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
+            const trimEnd = video.currentTime - 3;
             if (trimEnd > sourceBuffer.buffered.start(0)) {
                 try { sourceBuffer.remove(sourceBuffer.buffered.start(0), trimEnd); } catch(e) {}
             }
@@ -206,19 +262,27 @@
 
     // Snap to live edge if drifting
     setInterval(() => {
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         if (edge - video.currentTime > 1.0) {
             video.currentTime = edge - 0.05;
         }
     }, 500);
 
-    function detectCodec(initSeg) {
-        for (let i = 0; i < initSeg.length - 8; i++) {
-            if (initSeg[i]===0x61 && initSeg[i+1]===0x76 && initSeg[i+2]===0x63 && initSeg[i+3]===0x43) {
-                if (initSeg[i+4] === 1 && i+7 < initSeg.length) {
+    // Video event monitoring
+    video.addEventListener('error', (e) => {
+        const err = video.error;
+        report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
+    });
+    video.addEventListener('waiting', () => { if (hasPlayed) report('video waiting'); });
+    video.addEventListener('stalled', () => report('video stalled'));
+
+    function detectCodec(d) {
+        for (let i = 0; i < d.length - 8; i++) {
+            if (d[i]===0x61 && d[i+1]===0x76 && d[i+2]===0x63 && d[i+3]===0x43) {
+                if (d[i+4] === 1 && i+7 < d.length) {
                     const h = n => n.toString(16).padStart(2,'0');
-                    return 'avc1.' + h(initSeg[i+5]) + h(initSeg[i+6]) + h(initSeg[i+7]);
+                    return 'avc1.' + h(d[i+5]) + h(d[i+6]) + h(d[i+7]);
                 }
             }
         }
