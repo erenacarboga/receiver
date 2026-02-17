@@ -175,8 +175,10 @@
                 bufferQueue = [];
             });
 
-            // Append init segment
-            appendToBuffer(initSeg);
+            // Append init segment FIRST — must be before any fragments
+            // that may have arrived via WebSocket before sourceopen fired
+            bufferQueue.unshift(initSeg);
+            drainQueue();
 
             // Start play retry timer
             playRetryTimer = setInterval(() => {
