@@ -84,7 +84,7 @@
 
     const opts = new cast.framework.CastReceiverOptions();
     opts.disableIdleTimeout = true;
-    opts.statusText = 'Screen Mirroring';
+    opts.statusText = '';
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
