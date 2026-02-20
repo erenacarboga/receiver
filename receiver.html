@@ -97,6 +97,7 @@
     let lastTrimMs = 0, lastWaitingRecoveryMs = 0;
     let recentWaitingCount = 0, lastControlTickMs = 0;
     let driftEwma = 0.0, activeProfile = 'balanced';
+    let playInFlight = false, lastPlayAttemptMs = 0, lastPlayRejectLogMs = 0;
 
     const PROFILES = {
         aggressive: {
@@ -187,6 +188,7 @@
         hasPlayed = false; appendCount = 0; fatalError = false;
         lastTrimMs = 0; lastWaitingRecoveryMs = 0;
         recentWaitingCount = 0; lastControlTickMs = 0; driftEwma = 0.0; activeProfile = 'balanced';
+        playInFlight = false; lastPlayAttemptMs = 0; lastPlayRejectLogMs = 0;
         initMSE(initSeg);
     }
 
@@ -250,6 +252,7 @@
         hasPlayed = false; appendCount = 0; firstFragmentDTS = -1; fatalError = false;
         lastTrimMs = 0; lastWaitingRecoveryMs = 0;
         recentWaitingCount = 0; lastControlTickMs = 0; driftEwma = 0.0; activeProfile = 'balanced';
+        playInFlight = false; lastPlayAttemptMs = 0; lastPlayRejectLogMs = 0;
     }
 
     function initMSE(initSeg) {
@@ -352,6 +355,36 @@
         }
     }
 
+    function requestPlay(reason) {
+        const nowMs = Date.now();
+        if (playInFlight) return;
+        if (!video.paused) return;
+        if (nowMs - lastPlayAttemptMs < 250) return;
+
+        lastPlayAttemptMs = nowMs;
+        playInFlight = true;
+
+        video.play().then(() => {
+            playInFlight = false;
+            if (!hasPlayed) {
+                hasPlayed = true;
+                report('PLAYING! time=' + video.currentTime.toFixed(2));
+                statusEl.style.opacity = '0';
+                if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
+            }
+        }).catch((e) => {
+            playInFlight = false;
+            if (e && e.name === 'AbortError') {
+                if (nowMs - lastPlayRejectLogMs > 2000) {
+                    lastPlayRejectLogMs = nowMs;
+                    report('play() rejected (AbortError) during ' + reason);
+                }
+                return;
+            }
+            report('play() rejected: ' + (e ? e.name : 'Error') + ' ' + (e && e.message ? e.message : ''));
+        });
+    }
+
     function tryPlay() {
         if (!sourceBuffer) return;
         const profile = currentProfile();
@@ -361,16 +394,7 @@
             const bufferedAhead = edge - start;
             if (bufferedAhead < profile.startBuffer) return;
             video.currentTime = Math.max(0, edge - profile.startBehindEdge);
-            video.play().then(() => {
-                if (!hasPlayed) {
-                    hasPlayed = true;
-                    report('PLAYING! time=' + video.currentTime.toFixed(2));
-                    statusEl.style.opacity = '0';
-                    if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
-                }
-            }).catch((e) => {
-                report('play() rejected: ' + e.name + ' ' + e.message);
-            });
+            requestPlay('tryPlay');
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
             const nowMs = Date.now();
@@ -435,10 +459,19 @@
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             if (edge - video.currentTime > profile.waitRecoverDrift) {
                 video.currentTime = edge - profile.waitRecoverBehindEdge;
-                video.play().catch(() => {});
+                requestPlay('waiting');
                 report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
             }
         }
+    });
+    video.addEventListener('playing', () => {
+        playInFlight = false;
+    });
+    video.addEventListener('pause', () => {
+        if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        setTimeout(() => {
+            requestPlay('pause-event');
+        }, 80);
     });
     video.addEventListener('stalled', () => report('video stalled'));
 
