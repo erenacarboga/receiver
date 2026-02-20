@@ -94,6 +94,59 @@
     let bufferQueue = [], isAppending = false, initReceived = false;
     let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
     let playRetryTimer = null, fatalError = false;
+    let seekCooldownMs = 700;
+    let minLiveOffset = 0.10;
+    let maxLiveOffset = 0.45;
+    let stableLiveOffset = 0.18;
+    let congestedLiveOffset = 0.30;
+    let congestedQueueThreshold = 18;
+    let waitingRecoveryThreshold = 0.45;
+    let hardSeekThreshold = 1.6;
+    let softCatchupThreshold = 0.7;
+    let softCatchupRate = 1.02;
+    let normalRate = 1.0;
+    let seekLead = 0.12;
+    let trimBehindSeconds = 3.0;
+    let catchupIntervalMs = 300;
+    let waitingSeekBackoffMs = 1200;
+    let waitingSpikeWindowMs = 8000;
+    let waitingSpikeCountForCongestion = 3;
+    let queueSpikeForCongestion = 25;
+    let startedAtMs = Date.now();
+    let warmupDurationMs = 6000;
+    let waitingEvents = [];
+    let recentWaitings = [];
+    let seekState = { lastSeekAt: 0, lastWaitingSeekAt: 0 };
+
+    function nowMs() { return Date.now(); }
+
+    function canSeek() {
+        return (nowMs() - seekState.lastSeekAt) >= seekCooldownMs;
+    }
+
+    function recordSeek() {
+        seekState.lastSeekAt = nowMs();
+    }
+
+    function recordWaitingEvent() {
+        const t = nowMs();
+        recentWaitings.push(t);
+        while (recentWaitings.length > 0 && (t - recentWaitings[0]) > waitingSpikeWindowMs) {
+            recentWaitings.shift();
+        }
+    }
+
+    function isCongested() {
+        return bufferQueue.length >= queueSpikeForCongestion || recentWaitings.length >= waitingSpikeCountForCongestion;
+    }
+
+    function liveOffsetTarget() {
+        const inWarmup = (nowMs() - startedAtMs) < warmupDurationMs;
+        const base = (inWarmup || isCongested() || bufferQueue.length >= congestedQueueThreshold)
+            ? congestedLiveOffset
+            : stableLiveOffset;
+        return Math.min(maxLiveOffset, Math.max(minLiveOffset, base));
+    }
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -277,7 +330,8 @@
         if (!sourceBuffer) return;
         if (video.paused && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            video.currentTime = Math.max(0, edge - 0.12);
+            const target = liveOffsetTarget();
+            video.currentTime = Math.max(0, edge - target);
             video.play().then(() => {
                 if (!hasPlayed) {
                     hasPlayed = true;
@@ -290,7 +344,7 @@
             });
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
-            const trimEnd = video.currentTime - 2.5;
+            const trimEnd = video.currentTime - trimBehindSeconds;
             if (trimEnd > sourceBuffer.buffered.start(0)) {
                 try { sourceBuffer.remove(sourceBuffer.buffered.start(0), trimEnd); } catch(e) {}
             }
@@ -301,15 +355,17 @@
         if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
-        if (drift > 1.2) {
-            video.currentTime = edge - 0.12;
-            video.playbackRate = 1.0;
-        } else if (drift > 0.5) {
-            video.playbackRate = 1.03;
+        const target = liveOffsetTarget();
+        if (drift > hardSeekThreshold && canSeek()) {
+            video.currentTime = Math.max(0, edge - Math.max(target, seekLead));
+            recordSeek();
+            video.playbackRate = normalRate;
+        } else if (drift > softCatchupThreshold) {
+            video.playbackRate = softCatchupRate;
         } else {
-            video.playbackRate = 1.0;
+            video.playbackRate = normalRate;
         }
-    }, 250);
+    }, catchupIntervalMs);
 
     video.addEventListener('error', (e) => {
         const err = video.error;
@@ -320,10 +376,17 @@
     video.addEventListener('waiting', () => {
         if (!hasPlayed) return;
         report('video waiting');
+        recordWaitingEvent();
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            if (edge - video.currentTime > 0.35) {
-                video.currentTime = edge - 0.08;
+            const drift = edge - video.currentTime;
+            const t = nowMs();
+            const waitingSeekAllowed = (t - seekState.lastWaitingSeekAt) >= waitingSeekBackoffMs;
+            if (drift > waitingRecoveryThreshold && waitingSeekAllowed && canSeek()) {
+                const target = liveOffsetTarget();
+                video.currentTime = Math.max(0, edge - Math.max(target, 0.10));
+                seekState.lastWaitingSeekAt = t;
+                recordSeek();
                 video.play().catch(() => {});
                 report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
             }
