@@ -241,10 +241,10 @@
     }
 
     function appendToBuffer(data) {
-        if (bufferQueue.length > 30) {
+        if (bufferQueue.length > 90) {
             let dropped = 0;
             const keep = [];
-            for (let i = bufferQueue.length - 15; i < bufferQueue.length; i++) {
+            for (let i = bufferQueue.length - 45; i < bufferQueue.length; i++) {
                 if (i >= 0) keep.push(bufferQueue[i]);
             }
             dropped = bufferQueue.length - keep.length;
@@ -277,7 +277,7 @@
         if (!sourceBuffer) return;
         if (video.paused && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            video.currentTime = Math.max(0, edge - 0.05);
+            video.currentTime = Math.max(0, edge - 0.12);
             video.play().then(() => {
                 if (!hasPlayed) {
                     hasPlayed = true;
@@ -290,7 +290,7 @@
             });
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
-            const trimEnd = video.currentTime - 1;
+            const trimEnd = video.currentTime - 2.5;
             if (trimEnd > sourceBuffer.buffered.start(0)) {
                 try { sourceBuffer.remove(sourceBuffer.buffered.start(0), trimEnd); } catch(e) {}
             }
@@ -301,15 +301,15 @@
         if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
-        if (drift > 0.5) {
-            video.currentTime = edge - 0.05;
+        if (drift > 1.2) {
+            video.currentTime = edge - 0.12;
             video.playbackRate = 1.0;
-        } else if (drift > 0.2) {
-            video.playbackRate = 1.08;
+        } else if (drift > 0.5) {
+            video.playbackRate = 1.03;
         } else {
             video.playbackRate = 1.0;
         }
-    }, 150);
+    }, 250);
 
     video.addEventListener('error', (e) => {
         const err = video.error;
@@ -322,8 +322,9 @@
         report('video waiting');
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            if (edge - video.currentTime > 0.1) {
-                video.currentTime = edge - 0.02;
+            if (edge - video.currentTime > 0.35) {
+                video.currentTime = edge - 0.08;
+                video.play().catch(() => {});
                 report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
             }
         }
