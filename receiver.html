@@ -57,6 +57,7 @@
             statusEl.textContent = text;
         }
         statusEl.style.opacity = visible ? '0.8' : '0';
+        statusEl.style.display = visible ? 'block' : 'none';
     }
 
     function hideStatusIfRendering() {
@@ -216,6 +217,9 @@
         ws.onopen = () => {
             report('WebSocket connected');
             setStatus('Buffering...', true);
+            setTimeout(() => {
+                hideStatusIfRendering();
+            }, 1200);
         };
 
         ws.onmessage = (event) => {
@@ -325,6 +329,9 @@
                 info += ' range=[' + sourceBuffer.buffered.start(0).toFixed(3) + ',' + sourceBuffer.buffered.end(0).toFixed(3) + ']';
             }
             report(info);
+        }
+        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+            setStatus(null, false);
         }
         drainQueue();
         tryPlay();
@@ -488,6 +495,11 @@
         hideStatusIfRendering();
     });
     video.addEventListener('stalled', () => report('video stalled'));
+    setInterval(() => {
+        if (video.currentTime > 0.2 && !video.paused) {
+            setStatus(null, false);
+        }
+    }, 1000);
 
     function detectCodec(d) {
         for (let i = 0; i < d.length - 8; i++) {
