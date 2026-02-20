@@ -34,7 +34,6 @@
     <video id="v" autoplay muted playsinline></video>
     <script>
     const TAG = '[SMReceiver]';
-    const RECEIVER_VERSION = 'v3.4.2-playguard2';
     const NS = 'urn:x-cast:com.screenmirror.stream';
     const statusEl = document.getElementById('status');
     const video = document.getElementById('v');
@@ -83,143 +82,18 @@
         }
     );
 
-    pm.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, request => {
-        report('CAF PAUSE ignored (custom stream owns playback)');
-        return null;
-    });
-    pm.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, request => {
-        report('CAF PLAY ignored (custom stream owns playback)');
-        return null;
-    });
-    pm.setMessageInterceptor(cast.framework.messages.MessageType.SEEK, request => {
-        report('CAF SEEK ignored (custom stream owns playback)');
-        return null;
-    });
-    pm.setMessageInterceptor(cast.framework.messages.MessageType.STOP, request => {
-        report('CAF STOP ignored (custom stream owns playback)');
-        return null;
-    });
-
     const opts = new cast.framework.CastReceiverOptions();
     opts.disableIdleTimeout = true;
     opts.statusText = '';
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    console.log(TAG, 'Receiver started ' + RECEIVER_VERSION);
+    console.log(TAG, 'Receiver v2 started');
 
     let ws = null, mediaSource = null, sourceBuffer = null;
     let bufferQueue = [], isAppending = false, initReceived = false;
     let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
     let playRetryTimer = null, fatalError = false;
-    let seekCooldownMs = 700;
-    let minLiveOffset = 0.10;
-    let maxLiveOffset = 0.45;
-    let stableLiveOffset = 0.18;
-    let congestedLiveOffset = 0.30;
-    let congestedQueueThreshold = 18;
-    let waitingRecoveryThreshold = 0.45;
-    let hardSeekThreshold = 1.6;
-    let softCatchupThreshold = 0.7;
-    let softCatchupRate = 1.02;
-    let normalRate = 1.0;
-    let seekLead = 0.12;
-    let trimBehindSeconds = 3.0;
-    let catchupIntervalMs = 300;
-    let waitingSeekBackoffMs = 1200;
-    let waitingSpikeWindowMs = 8000;
-    let waitingSpikeCountForCongestion = 3;
-    let queueSpikeForCongestion = 25;
-    let startedAtMs = Date.now();
-    let warmupDurationMs = 6000;
-    let recentWaitings = [];
-    let seekState = { lastSeekAt: 0, lastWaitingSeekAt: 0 };
-    let playState = {
-        inFlight: false,
-        lastAttemptAt: 0,
-        minAttemptIntervalMs: 900,
-        lastRejectLogAt: 0,
-        rejectLogIntervalMs: 8000
-    };
-    let lastPlaySeekAt = 0;
-    let playSeekCooldownMs = 700;
-
-    function nowMs() { return Date.now(); }
-
-    function canSeek() {
-        return (nowMs() - seekState.lastSeekAt) >= seekCooldownMs;
-    }
-
-    function recordSeek() {
-        seekState.lastSeekAt = nowMs();
-    }
-
-    function recordWaitingEvent() {
-        const t = nowMs();
-        recentWaitings.push(t);
-        while (recentWaitings.length > 0 && (t - recentWaitings[0]) > waitingSpikeWindowMs) {
-            recentWaitings.shift();
-        }
-    }
-
-    function isCongested() {
-        return bufferQueue.length >= queueSpikeForCongestion || recentWaitings.length >= waitingSpikeCountForCongestion;
-    }
-
-    function liveOffsetTarget() {
-        const inWarmup = (nowMs() - startedAtMs) < warmupDurationMs;
-        const base = (inWarmup || isCongested() || bufferQueue.length >= congestedQueueThreshold)
-            ? congestedLiveOffset
-            : stableLiveOffset;
-        return Math.min(maxLiveOffset, Math.max(minLiveOffset, base));
-    }
-
-    function requestPlay(reason) {
-        if (!sourceBuffer || fatalError) return;
-        if (!video.paused) return;
-        if (playState.inFlight) return;
-
-        const t = nowMs();
-        if (t - playState.lastAttemptAt < playState.minAttemptIntervalMs) return;
-        if (sourceBuffer.buffered.length === 0) return;
-
-        playState.lastAttemptAt = t;
-        let playPromise;
-        try {
-            playPromise = video.play();
-        } catch (e) {
-            if (t - playState.lastRejectLogAt >= playState.rejectLogIntervalMs) {
-                playState.lastRejectLogAt = t;
-                report('play() throw [' + reason + ']: ' + e.name + ' ' + e.message);
-            }
-            return;
-        }
-
-        if (!playPromise || typeof playPromise.then !== 'function') {
-            return;
-        }
-
-        playState.inFlight = true;
-        playPromise.then(() => {
-            playState.inFlight = false;
-            if (!hasPlayed) {
-                hasPlayed = true;
-                report('PLAYING! time=' + video.currentTime.toFixed(2));
-                statusEl.style.opacity = '0';
-                if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
-            }
-        }).catch((e) => {
-            playState.inFlight = false;
-            if (e && e.name === 'AbortError') {
-                return;
-            }
-            const now = nowMs();
-            if (now - playState.lastRejectLogAt >= playState.rejectLogIntervalMs) {
-                playState.lastRejectLogAt = now;
-                report('play() rejected [' + reason + ']: ' + e.name + ' ' + e.message);
-            }
-        });
-    }
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -237,8 +111,6 @@
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false;
         hasPlayed = false; appendCount = 0; fatalError = false;
-        playState.inFlight = false;
-        playState.lastAttemptAt = 0;
         initMSE(initSeg);
     }
 
@@ -300,8 +172,6 @@
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false; initReceived = false;
         hasPlayed = false; appendCount = 0; firstFragmentDTS = -1; fatalError = false;
-        playState.inFlight = false;
-        playState.lastAttemptAt = 0;
     }
 
     function initMSE(initSeg) {
@@ -406,18 +276,21 @@
     function tryPlay() {
         if (!sourceBuffer) return;
         if (video.paused && sourceBuffer.buffered.length > 0) {
-            if (playState.inFlight) return;
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            const target = liveOffsetTarget();
-            const t = nowMs();
-            if (t - lastPlaySeekAt >= playSeekCooldownMs) {
-                video.currentTime = Math.max(0, edge - target);
-                lastPlaySeekAt = t;
-            }
-            requestPlay('tryPlay');
+            video.currentTime = Math.max(0, edge - 0.12);
+            video.play().then(() => {
+                if (!hasPlayed) {
+                    hasPlayed = true;
+                    report('PLAYING! time=' + video.currentTime.toFixed(2));
+                    statusEl.style.opacity = '0';
+                    if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
+                }
+            }).catch((e) => {
+                report('play() rejected: ' + e.name + ' ' + e.message);
+            });
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
-            const trimEnd = video.currentTime - trimBehindSeconds;
+            const trimEnd = video.currentTime - 2.5;
             if (trimEnd > sourceBuffer.buffered.start(0)) {
                 try { sourceBuffer.remove(sourceBuffer.buffered.start(0), trimEnd); } catch(e) {}
             }
@@ -428,32 +301,15 @@
         if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
-        const target = liveOffsetTarget();
-        if (drift > hardSeekThreshold && canSeek()) {
-            video.currentTime = Math.max(0, edge - Math.max(target, seekLead));
-            recordSeek();
-            video.playbackRate = normalRate;
-        } else if (drift > softCatchupThreshold) {
-            video.playbackRate = softCatchupRate;
+        if (drift > 1.2) {
+            video.currentTime = edge - 0.12;
+            video.playbackRate = 1.0;
+        } else if (drift > 0.5) {
+            video.playbackRate = 1.03;
         } else {
-            video.playbackRate = normalRate;
+            video.playbackRate = 1.0;
         }
-    }, catchupIntervalMs);
-
-    setInterval(() => {
-        if (!sourceBuffer || fatalError || playState.inFlight) return;
-        if (!video.paused) return;
-        if (sourceBuffer.buffered.length === 0) return;
-
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const drift = edge - video.currentTime;
-        if (drift > 1.2 && canSeek()) {
-            const target = liveOffsetTarget();
-            video.currentTime = Math.max(0, edge - Math.max(target, 0.12));
-            recordSeek();
-        }
-        requestPlay('resume-monitor');
-    }, 750);
+    }, 250);
 
     video.addEventListener('error', (e) => {
         const err = video.error;
@@ -461,29 +317,14 @@
         fatalError = true;
         bufferQueue = [];
     });
-    video.addEventListener('pause', () => {
-        if (!hasPlayed || fatalError || !sourceBuffer) return;
-        if (sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const drift = edge - video.currentTime;
-        if (drift < 0.12) return;
-        setTimeout(() => requestPlay('pause-event'), 300);
-    });
     video.addEventListener('waiting', () => {
         if (!hasPlayed) return;
         report('video waiting');
-        recordWaitingEvent();
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            const drift = edge - video.currentTime;
-            const t = nowMs();
-            const waitingSeekAllowed = (t - seekState.lastWaitingSeekAt) >= waitingSeekBackoffMs;
-            if (drift > waitingRecoveryThreshold && waitingSeekAllowed && canSeek()) {
-                const target = liveOffsetTarget();
-                video.currentTime = Math.max(0, edge - Math.max(target, 0.10));
-                seekState.lastWaitingSeekAt = t;
-                recordSeek();
-                requestPlay('waiting');
+            if (edge - video.currentTime > 0.35) {
+                video.currentTime = edge - 0.08;
+                video.play().catch(() => {});
                 report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
             }
         }
