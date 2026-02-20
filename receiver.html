@@ -184,12 +184,14 @@
 
             try {
                 sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
-                report('SourceBuffer created OK');
+                sourceBuffer.mode = 'sequence';
+                report('SourceBuffer created OK (sequence mode)');
             } catch (e) {
                 report('addSourceBuffer failed with ' + codec + ': ' + e.message);
                 try {
                     sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
-                    report('Fallback SourceBuffer created (Baseline)');
+                    sourceBuffer.mode = 'sequence';
+                    report('Fallback SourceBuffer created (Baseline, sequence mode)');
                 } catch (e2) {
                     report('Fallback addSourceBuffer also failed: ' + e2.message);
                     return;
@@ -317,7 +319,17 @@
         fatalError = true;
         bufferQueue = [];
     });
-    video.addEventListener('waiting', () => { if (hasPlayed) report('video waiting'); });
+    video.addEventListener('waiting', () => {
+        if (!hasPlayed) return;
+        report('video waiting');
+        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            if (edge - video.currentTime > 0.1) {
+                video.currentTime = edge - 0.02;
+                report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
+            }
+        }
+    });
     video.addEventListener('stalled', () => report('video stalled'));
 
     function detectCodec(d) {
