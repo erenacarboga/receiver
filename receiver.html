@@ -31,9 +31,10 @@
 <body>
     <div id="status">Waiting for stream...</div>
     <img id="welcome-img" />
-    <video id="v" autoplay muted playsinline></video>
+    <video id="v" muted playsinline></video>
     <script>
     const TAG = '[SMReceiver]';
+    const RECEIVER_VERSION = 'v3.4.2-playguard2';
     const NS = 'urn:x-cast:com.screenmirror.stream';
     const statusEl = document.getElementById('status');
     const video = document.getElementById('v');
@@ -88,7 +89,7 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    console.log(TAG, 'Receiver v2 started');
+    console.log(TAG, 'Receiver started ' + RECEIVER_VERSION);
 
     let ws = null, mediaSource = null, sourceBuffer = null;
     let bufferQueue = [], isAppending = false, initReceived = false;
@@ -119,9 +120,9 @@
     let playState = {
         inFlight: false,
         lastAttemptAt: 0,
-        minAttemptIntervalMs: 450,
+        minAttemptIntervalMs: 900,
         lastRejectLogAt: 0,
-        rejectLogIntervalMs: 2000
+        rejectLogIntervalMs: 8000
     };
 
     function nowMs() { return Date.now(); }
@@ -190,6 +191,11 @@
             }
         }).catch((e) => {
             playState.inFlight = false;
+            if (e && e.name === 'AbortError') {
+                // Common while platform toggles playback internally.
+                // Avoid log spam; pause-event handler will retry safely.
+                return;
+            }
             const now = nowMs();
             if (now - playState.lastRejectLogAt >= playState.rejectLogIntervalMs) {
                 playState.lastRejectLogAt = now;
@@ -417,6 +423,14 @@
         report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
         fatalError = true;
         bufferQueue = [];
+    });
+    video.addEventListener('pause', () => {
+        if (!hasPlayed || fatalError || !sourceBuffer) return;
+        if (sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const drift = edge - video.currentTime;
+        if (drift < 0.12) return;
+        setTimeout(() => requestPlay('pause-event'), 300);
     });
     video.addEventListener('waiting', () => {
         if (!hasPlayed) return;
