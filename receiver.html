@@ -184,14 +184,12 @@
 
             try {
                 sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
-                sourceBuffer.mode = 'sequence';
-                report('SourceBuffer created OK (sequence mode)');
+                report('SourceBuffer created OK');
             } catch (e) {
                 report('addSourceBuffer failed with ' + codec + ': ' + e.message);
                 try {
                     sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
-                    sourceBuffer.mode = 'sequence';
-                    report('Fallback SourceBuffer created (Baseline, sequence mode)');
+                    report('Fallback SourceBuffer created (Baseline)');
                 } catch (e2) {
                     report('Fallback addSourceBuffer also failed: ' + e2.message);
                     return;
