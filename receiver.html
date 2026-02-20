@@ -116,7 +116,7 @@
             queueKeep: 30
         },
         balanced: {
-            startBuffer: 0.35,
+            startBuffer: 0.45,
             startBehindEdge: 0.18,
             hardSeekDrift: 1.0,
             gentleDrift: 0.40,
@@ -131,7 +131,7 @@
             queueKeep: 45
         },
         stable: {
-            startBuffer: 0.50,
+            startBuffer: 0.65,
             startBehindEdge: 0.25,
             hardSeekDrift: 1.6,
             gentleDrift: 0.75,
@@ -160,8 +160,6 @@
         let next = 'balanced';
         if (recentWaitingCount >= 3 || driftEwma > 1.35 || bufferQueue.length > 80) {
             next = 'stable';
-        } else if (recentWaitingCount === 0 && driftEwma < 0.45 && bufferQueue.length < 18) {
-            next = 'aggressive';
         }
 
         if (next !== activeProfile) {
@@ -445,15 +443,16 @@
     });
     video.addEventListener('waiting', () => {
         if (!hasPlayed) return;
+        const profile = currentProfile();
+        const nowMs = Date.now();
+        if (nowMs - lastWaitingRecoveryMs < profile.waitCooldownMs) return;
+        lastWaitingRecoveryMs = nowMs;
+
         recentWaitingCount += 1;
         setTimeout(() => {
             recentWaitingCount = Math.max(0, recentWaitingCount - 1);
         }, 4500);
 
-        const profile = currentProfile();
-        const nowMs = Date.now();
-        if (nowMs - lastWaitingRecoveryMs < profile.waitCooldownMs) return;
-        lastWaitingRecoveryMs = nowMs;
         report('video waiting');
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
@@ -466,12 +465,6 @@
     });
     video.addEventListener('playing', () => {
         playInFlight = false;
-    });
-    video.addEventListener('pause', () => {
-        if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        setTimeout(() => {
-            requestPlay('pause-event');
-        }, 80);
     });
     video.addEventListener('stalled', () => report('video stalled'));
 
