@@ -52,6 +52,19 @@
         }
     }
 
+    function setStatus(text, visible) {
+        if (typeof text === 'string') {
+            statusEl.textContent = text;
+        }
+        statusEl.style.opacity = visible ? '0.8' : '0';
+    }
+
+    function hideStatusIfRendering() {
+        if (video.readyState >= 2 || !video.paused) {
+            setStatus(null, false);
+        }
+    }
+
     ctx.addCustomMessageListener(NS, event => {
         senderBusId = event.senderId;
         console.log(TAG, 'Custom message from', event.senderId, ':', JSON.stringify(event.data));
@@ -173,7 +186,7 @@
         welcomeImg.src = imageUrl;
         welcomeImg.style.display = 'block';
         video.style.display = 'none';
-        statusEl.style.opacity = '0';
+        setStatus(null, false);
     }
 
     function reinitMSE(initSeg) {
@@ -194,8 +207,7 @@
         welcomeImg.style.display = 'none';
         video.style.display = 'block';
         report('Connecting to ' + wsUrl);
-        statusEl.textContent = 'Connecting...';
-        statusEl.style.opacity = '0.8';
+        setStatus('Connecting...', true);
         stopStream();
 
         ws = new WebSocket(wsUrl);
@@ -203,7 +215,7 @@
 
         ws.onopen = () => {
             report('WebSocket connected');
-            statusEl.textContent = 'Buffering...';
+            setStatus('Buffering...', true);
         };
 
         ws.onmessage = (event) => {
@@ -224,8 +236,7 @@
 
         ws.onerror = (e) => {
             report('WS error');
-            statusEl.textContent = 'Connection error';
-            statusEl.style.opacity = '0.8';
+            setStatus('Connection error', true);
         };
 
         ws.onclose = () => {
@@ -367,7 +378,7 @@
             if (!hasPlayed) {
                 hasPlayed = true;
                 report('PLAYING! time=' + video.currentTime.toFixed(2));
-                statusEl.style.opacity = '0';
+                setStatus(null, false);
                 if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
             }
         }).catch((e) => {
@@ -465,6 +476,16 @@
     });
     video.addEventListener('playing', () => {
         playInFlight = false;
+        setStatus(null, false);
+    });
+    video.addEventListener('timeupdate', () => {
+        hideStatusIfRendering();
+    });
+    video.addEventListener('canplay', () => {
+        hideStatusIfRendering();
+    });
+    video.addEventListener('loadeddata', () => {
+        hideStatusIfRendering();
     });
     video.addEventListener('stalled', () => report('video stalled'));
 
