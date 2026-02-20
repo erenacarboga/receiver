@@ -31,7 +31,7 @@
 <body>
     <div id="status">Waiting for stream...</div>
     <img id="welcome-img" />
-    <video id="v" muted playsinline></video>
+    <video id="v" autoplay muted playsinline></video>
     <script>
     const TAG = '[SMReceiver]';
     const RECEIVER_VERSION = 'v3.4.2-playguard2';
@@ -83,6 +83,23 @@
         }
     );
 
+    pm.setMessageInterceptor(cast.framework.messages.MessageType.PAUSE, request => {
+        report('CAF PAUSE ignored (custom stream owns playback)');
+        return null;
+    });
+    pm.setMessageInterceptor(cast.framework.messages.MessageType.PLAY, request => {
+        report('CAF PLAY ignored (custom stream owns playback)');
+        return null;
+    });
+    pm.setMessageInterceptor(cast.framework.messages.MessageType.SEEK, request => {
+        report('CAF SEEK ignored (custom stream owns playback)');
+        return null;
+    });
+    pm.setMessageInterceptor(cast.framework.messages.MessageType.STOP, request => {
+        report('CAF STOP ignored (custom stream owns playback)');
+        return null;
+    });
+
     const opts = new cast.framework.CastReceiverOptions();
     opts.disableIdleTimeout = true;
     opts.statusText = '';
@@ -124,6 +141,8 @@
         lastRejectLogAt: 0,
         rejectLogIntervalMs: 8000
     };
+    let lastPlaySeekAt = 0;
+    let playSeekCooldownMs = 700;
 
     function nowMs() { return Date.now(); }
 
@@ -192,8 +211,6 @@
         }).catch((e) => {
             playState.inFlight = false;
             if (e && e.name === 'AbortError') {
-                // Common while platform toggles playback internally.
-                // Avoid log spam; pause-event handler will retry safely.
                 return;
             }
             const now = nowMs();
@@ -389,9 +406,14 @@
     function tryPlay() {
         if (!sourceBuffer) return;
         if (video.paused && sourceBuffer.buffered.length > 0) {
+            if (playState.inFlight) return;
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             const target = liveOffsetTarget();
-            video.currentTime = Math.max(0, edge - target);
+            const t = nowMs();
+            if (t - lastPlaySeekAt >= playSeekCooldownMs) {
+                video.currentTime = Math.max(0, edge - target);
+                lastPlaySeekAt = t;
+            }
             requestPlay('tryPlay');
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
@@ -417,6 +439,21 @@
             video.playbackRate = normalRate;
         }
     }, catchupIntervalMs);
+
+    setInterval(() => {
+        if (!sourceBuffer || fatalError || playState.inFlight) return;
+        if (!video.paused) return;
+        if (sourceBuffer.buffered.length === 0) return;
+
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const drift = edge - video.currentTime;
+        if (drift > 1.2 && canSeek()) {
+            const target = liveOffsetTarget();
+            video.currentTime = Math.max(0, edge - Math.max(target, 0.12));
+            recordSeek();
+        }
+        requestPlay('resume-monitor');
+    }, 750);
 
     video.addEventListener('error', (e) => {
         const err = video.error;
