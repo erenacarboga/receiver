@@ -114,9 +114,15 @@
     let queueSpikeForCongestion = 25;
     let startedAtMs = Date.now();
     let warmupDurationMs = 6000;
-    let waitingEvents = [];
     let recentWaitings = [];
     let seekState = { lastSeekAt: 0, lastWaitingSeekAt: 0 };
+    let playState = {
+        inFlight: false,
+        lastAttemptAt: 0,
+        minAttemptIntervalMs: 450,
+        lastRejectLogAt: 0,
+        rejectLogIntervalMs: 2000
+    };
 
     function nowMs() { return Date.now(); }
 
@@ -148,6 +154,50 @@
         return Math.min(maxLiveOffset, Math.max(minLiveOffset, base));
     }
 
+    function requestPlay(reason) {
+        if (!sourceBuffer || fatalError) return;
+        if (!video.paused) return;
+        if (playState.inFlight) return;
+
+        const t = nowMs();
+        if (t - playState.lastAttemptAt < playState.minAttemptIntervalMs) return;
+        if (sourceBuffer.buffered.length === 0) return;
+
+        playState.lastAttemptAt = t;
+        let playPromise;
+        try {
+            playPromise = video.play();
+        } catch (e) {
+            if (t - playState.lastRejectLogAt >= playState.rejectLogIntervalMs) {
+                playState.lastRejectLogAt = t;
+                report('play() throw [' + reason + ']: ' + e.name + ' ' + e.message);
+            }
+            return;
+        }
+
+        if (!playPromise || typeof playPromise.then !== 'function') {
+            return;
+        }
+
+        playState.inFlight = true;
+        playPromise.then(() => {
+            playState.inFlight = false;
+            if (!hasPlayed) {
+                hasPlayed = true;
+                report('PLAYING! time=' + video.currentTime.toFixed(2));
+                statusEl.style.opacity = '0';
+                if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
+            }
+        }).catch((e) => {
+            playState.inFlight = false;
+            const now = nowMs();
+            if (now - playState.lastRejectLogAt >= playState.rejectLogIntervalMs) {
+                playState.lastRejectLogAt = now;
+                report('play() rejected [' + reason + ']: ' + e.name + ' ' + e.message);
+            }
+        });
+    }
+
     function showWelcome(imageUrl) {
         stopStream();
         welcomeImg.src = imageUrl;
@@ -164,6 +214,8 @@
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false;
         hasPlayed = false; appendCount = 0; fatalError = false;
+        playState.inFlight = false;
+        playState.lastAttemptAt = 0;
         initMSE(initSeg);
     }
 
@@ -225,6 +277,8 @@
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false; initReceived = false;
         hasPlayed = false; appendCount = 0; firstFragmentDTS = -1; fatalError = false;
+        playState.inFlight = false;
+        playState.lastAttemptAt = 0;
     }
 
     function initMSE(initSeg) {
@@ -332,16 +386,7 @@
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             const target = liveOffsetTarget();
             video.currentTime = Math.max(0, edge - target);
-            video.play().then(() => {
-                if (!hasPlayed) {
-                    hasPlayed = true;
-                    report('PLAYING! time=' + video.currentTime.toFixed(2));
-                    statusEl.style.opacity = '0';
-                    if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
-                }
-            }).catch((e) => {
-                report('play() rejected: ' + e.name + ' ' + e.message);
-            });
+            requestPlay('tryPlay');
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
             const trimEnd = video.currentTime - trimBehindSeconds;
@@ -387,7 +432,7 @@
                 video.currentTime = Math.max(0, edge - Math.max(target, 0.10));
                 seekState.lastWaitingSeekAt = t;
                 recordSeek();
-                video.play().catch(() => {});
+                requestPlay('waiting');
                 report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
             }
         }
