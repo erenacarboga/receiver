@@ -94,6 +94,7 @@
     let bufferQueue = [], isAppending = false, initReceived = false;
     let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
     let playRetryTimer = null, fatalError = false;
+    let lastTrimMs = 0, lastWaitingRecoveryMs = 0;
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -111,6 +112,7 @@
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false;
         hasPlayed = false; appendCount = 0; fatalError = false;
+        lastTrimMs = 0; lastWaitingRecoveryMs = 0;
         initMSE(initSeg);
     }
 
@@ -172,6 +174,7 @@
         mediaSource = null; sourceBuffer = null;
         bufferQueue = []; isAppending = false; initReceived = false;
         hasPlayed = false; appendCount = 0; firstFragmentDTS = -1; fatalError = false;
+        lastTrimMs = 0; lastWaitingRecoveryMs = 0;
     }
 
     function initMSE(initSeg) {
@@ -276,8 +279,11 @@
     function tryPlay() {
         if (!sourceBuffer) return;
         if (video.paused && sourceBuffer.buffered.length > 0) {
+            const start = sourceBuffer.buffered.start(0);
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            video.currentTime = Math.max(0, edge - 0.12);
+            const bufferedAhead = edge - start;
+            if (bufferedAhead < 0.35) return;
+            video.currentTime = Math.max(0, edge - 0.18);
             video.play().then(() => {
                 if (!hasPlayed) {
                     hasPlayed = true;
@@ -290,9 +296,20 @@
             });
         }
         if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
-            const trimEnd = video.currentTime - 2.5;
-            if (trimEnd > sourceBuffer.buffered.start(0)) {
-                try { sourceBuffer.remove(sourceBuffer.buffered.start(0), trimEnd); } catch(e) {}
+            const nowMs = Date.now();
+            const start = sourceBuffer.buffered.start(0);
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            const backBuffer = video.currentTime - start;
+            const totalBuffered = edge - start;
+
+            if (totalBuffered > 8.0 && backBuffer > 5.0 && nowMs - lastTrimMs > 1800) {
+                const trimEnd = video.currentTime - 4.0;
+                if (trimEnd > start) {
+                    try {
+                        sourceBuffer.remove(start, trimEnd);
+                        lastTrimMs = nowMs;
+                    } catch(e) {}
+                }
             }
         }
     }
@@ -319,6 +336,9 @@
     });
     video.addEventListener('waiting', () => {
         if (!hasPlayed) return;
+        const nowMs = Date.now();
+        if (nowMs - lastWaitingRecoveryMs < 700) return;
+        lastWaitingRecoveryMs = nowMs;
         report('video waiting');
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
