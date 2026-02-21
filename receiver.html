@@ -114,6 +114,8 @@
     let playInFlight = false, lastPlayAttemptMs = 0, lastPlayRejectLogMs = 0;
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastInitSeg = null;
+    let lastReinitMs = 0;
+    const REINIT_COOLDOWN_MS = 4000;
 
     const PROFILES = {
         aggressive: {
@@ -193,6 +195,12 @@
     }
 
     function reinitMSE(initSeg) {
+        const nowMs = Date.now();
+        if (nowMs - lastReinitMs < REINIT_COOLDOWN_MS) {
+            report('reinit skipped (cooldown ' + (REINIT_COOLDOWN_MS - (nowMs - lastReinitMs)) + 'ms remaining)');
+            return;
+        }
+        lastReinitMs = nowMs;
         if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
             try { mediaSource.endOfStream(); } catch(e) {}
@@ -284,12 +292,14 @@
 
             try {
                 sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
-                report('SourceBuffer created OK');
+                sourceBuffer.mode = 'sequence';
+                report('SourceBuffer created OK (sequence mode)');
             } catch (e) {
                 report('addSourceBuffer failed with ' + codec + ': ' + e.message);
                 try {
                     sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
-                    report('Fallback SourceBuffer created (Baseline)');
+                    sourceBuffer.mode = 'sequence';
+                    report('Fallback SourceBuffer created (Baseline, sequence mode)');
                 } catch (e2) {
                     report('Fallback addSourceBuffer also failed: ' + e2.message);
                     return;
@@ -445,7 +455,7 @@
             updateAdaptiveProfile();
         }
 
-        if (sourceBuffer.buffered.length > 3 && lastInitSeg) {
+        if (sourceBuffer.buffered.length > 5 && lastInitSeg) {
             report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
             reinitMSE(lastInitSeg);
             return;
@@ -453,8 +463,8 @@
 
         const ct = video.currentTime;
         if (lastProgressCT >= 0 && Math.abs(ct - lastProgressCT) < 0.01) {
-            if (nowMs - lastProgressTime > 3000 && lastInitSeg) {
-                report('Stall detected (' + ct.toFixed(2) + 's for 3s) — reinit');
+            if (nowMs - lastProgressTime > 4000 && lastInitSeg) {
+                report('Stall detected (' + ct.toFixed(2) + 's for 4s) — reinit');
                 lastProgressCT = -1;
                 reinitMSE(lastInitSeg);
                 return;
@@ -527,11 +537,6 @@
     });
     video.addEventListener('stalled', () => {
         report('video stalled bl=' + (sourceBuffer ? sourceBuffer.buffered.length : 0));
-        if (sourceBuffer && sourceBuffer.buffered.length > 3 && lastInitSeg) {
-            report('Stalled + fragmented — reinit MSE');
-            reinitMSE(lastInitSeg);
-            return;
-        }
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             if (edge - video.currentTime > 0.3) {
