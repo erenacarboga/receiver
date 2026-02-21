@@ -112,6 +112,8 @@
     let recentWaitingCount = 0, lastControlTickMs = 0;
     let driftEwma = 0.0, activeProfile = 'balanced';
     let playInFlight = false, lastPlayAttemptMs = 0, lastPlayRejectLogMs = 0;
+    let lastProgressTime = 0, lastProgressCT = -1;
+    let lastInitSeg = null;
 
     const PROFILES = {
         aggressive: {
@@ -201,6 +203,7 @@
         lastTrimMs = 0; lastWaitingRecoveryMs = 0;
         recentWaitingCount = 0; lastControlTickMs = 0; driftEwma = 0.0; activeProfile = 'balanced';
         playInFlight = false; lastPlayAttemptMs = 0; lastPlayRejectLogMs = 0;
+        lastProgressCT = -1;
         initMSE(initSeg);
     }
 
@@ -226,11 +229,13 @@
             const data = new Uint8Array(event.data);
             if (!initReceived) {
                 initReceived = true;
+                lastInitSeg = data;
                 report('Init segment: ' + data.length + ' bytes');
                 initMSE(data);
                 return;
             }
             if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+                lastInitSeg = data;
                 report('Re-init segment (resolution change): ' + data.length + ' bytes');
                 reinitMSE(data);
                 return;
@@ -266,6 +271,7 @@
         lastTrimMs = 0; lastWaitingRecoveryMs = 0;
         recentWaitingCount = 0; lastControlTickMs = 0; driftEwma = 0.0; activeProfile = 'balanced';
         playInFlight = false; lastPlayAttemptMs = 0; lastPlayRejectLogMs = 0;
+        lastProgressCT = -1;
     }
 
     function initMSE(initSeg) {
@@ -439,6 +445,25 @@
             updateAdaptiveProfile();
         }
 
+        if (sourceBuffer.buffered.length > 3 && lastInitSeg) {
+            report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+            reinitMSE(lastInitSeg);
+            return;
+        }
+
+        const ct = video.currentTime;
+        if (lastProgressCT >= 0 && Math.abs(ct - lastProgressCT) < 0.01) {
+            if (nowMs - lastProgressTime > 3000 && lastInitSeg) {
+                report('Stall detected (' + ct.toFixed(2) + 's for 3s) — reinit');
+                lastProgressCT = -1;
+                reinitMSE(lastInitSeg);
+                return;
+            }
+        } else {
+            lastProgressTime = nowMs;
+            lastProgressCT = ct;
+        }
+
         const profile = currentProfile();
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
@@ -456,8 +481,14 @@
     video.addEventListener('error', (e) => {
         const err = video.error;
         report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
-        fatalError = true;
-        bufferQueue = [];
+        if (lastInitSeg) {
+            report('Video error — reinit MSE');
+            fatalError = false;
+            setTimeout(() => reinitMSE(lastInitSeg), 500);
+        } else {
+            fatalError = true;
+            bufferQueue = [];
+        }
     });
     video.addEventListener('waiting', () => {
         if (!hasPlayed) return;
@@ -494,7 +525,20 @@
     video.addEventListener('loadeddata', () => {
         hideStatusIfRendering();
     });
-    video.addEventListener('stalled', () => report('video stalled'));
+    video.addEventListener('stalled', () => {
+        report('video stalled bl=' + (sourceBuffer ? sourceBuffer.buffered.length : 0));
+        if (sourceBuffer && sourceBuffer.buffered.length > 3 && lastInitSeg) {
+            report('Stalled + fragmented — reinit MSE');
+            reinitMSE(lastInitSeg);
+            return;
+        }
+        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            if (edge - video.currentTime > 0.3) {
+                video.currentTime = edge - 0.05;
+            }
+        }
+    });
     setInterval(() => {
         if (video.currentTime > 0.2 && !video.paused) {
             setStatus(null, false);
