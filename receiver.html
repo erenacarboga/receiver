@@ -119,8 +119,8 @@
 
     const PROFILES = {
         aggressive: {
-            startBuffer: 0.10,
-            startBehindEdge: 0.04,
+            startBuffer: 0.02,
+            startBehindEdge: 0.01,
             hardSeekDrift: 0.35,
             gentleDrift: 0.12,
             gentleRate: 1.06,
@@ -134,8 +134,8 @@
             queueKeep: 10
         },
         balanced: {
-            startBuffer: 0.20,
-            startBehindEdge: 0.08,
+            startBuffer: 0.05,
+            startBehindEdge: 0.02,
             hardSeekDrift: 0.55,
             gentleDrift: 0.20,
             gentleRate: 1.04,
@@ -149,8 +149,8 @@
             queueKeep: 20
         },
         stable: {
-            startBuffer: 0.35,
-            startBehindEdge: 0.12,
+            startBuffer: 0.10,
+            startBehindEdge: 0.05,
             hardSeekDrift: 0.90,
             gentleDrift: 0.40,
             gentleRate: 1.025,
@@ -205,6 +205,12 @@
             return;
         }
         lastReinitMs = nowMs;
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send("FORCE_KEYFRAME");
+            report('Sent FORCE_KEYFRAME to relay');
+        }
+
         if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
             try { mediaSource.endOfStream(); } catch(e) {}
@@ -438,21 +444,30 @@
             if (bufferedAhead < profile.startBuffer) return;
             video.currentTime = Math.max(0, edge - profile.startBehindEdge);
             requestPlay('tryPlay');
-        }
-        if (!video.paused && sourceBuffer && !sourceBuffer.updating && sourceBuffer.buffered.length > 0) {
-            const nowMs = Date.now();
-            const start = sourceBuffer.buffered.start(0);
-            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            const backBuffer = video.currentTime - start;
-            const totalBuffered = edge - start;
+        } else if (!video.paused && sourceBuffer.buffered.length > 0) {
+            if (video.readyState <= 2) {
+                const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+                if (edge - video.currentTime > 0.05) {
+                    video.currentTime = edge - profile.startBehindEdge;
+                    requestPlay('nudge-resume');
+                }
+            }
 
-            if (totalBuffered > profile.trimTotalBuffer && backBuffer > profile.trimBackBuffer && nowMs - lastTrimMs > 1200) {
-                const trimEnd = video.currentTime - profile.trimKeepBehind;
-                if (trimEnd > start) {
-                    try {
-                        sourceBuffer.remove(start, trimEnd);
-                        lastTrimMs = nowMs;
-                    } catch(e) {}
+            if (!sourceBuffer.updating) {
+                const nowMs = Date.now();
+                const start = sourceBuffer.buffered.start(0);
+                const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+                const backBuffer = video.currentTime - start;
+                const totalBuffered = edge - start;
+
+                if (totalBuffered > profile.trimTotalBuffer && backBuffer > profile.trimBackBuffer && nowMs - lastTrimMs > 1200) {
+                    const trimEnd = video.currentTime - profile.trimKeepBehind;
+                    if (trimEnd > start) {
+                        try {
+                            sourceBuffer.remove(start, trimEnd);
+                            lastTrimMs = nowMs;
+                        } catch(e) {}
+                    }
                 }
             }
         }
@@ -474,8 +489,11 @@
 
         const ct = video.currentTime;
         if (lastProgressCT >= 0 && Math.abs(ct - lastProgressCT) < 0.01) {
-            if (nowMs - lastProgressTime > 2500 && lastInitSeg) {
-                report('Stall detected (' + ct.toFixed(2) + 's for 2.5s) \u2014 reinit');
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            const isAtEdge = (edge - ct) < 0.1;
+            
+            if (nowMs - lastProgressTime > 2500 && lastInitSeg && !isAtEdge) {
+                report('Stall detected (' + ct.toFixed(2) + 's for 2.5s, edge=' + edge.toFixed(2) + ') \u2014 reinit');
                 lastProgressCT = -1;
                 reinitMSE(lastInitSeg);
                 return;
