@@ -115,53 +115,53 @@
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastInitSeg = null;
     let lastReinitMs = 0;
-    const REINIT_COOLDOWN_MS = 4000;
+    const REINIT_COOLDOWN_MS = 2000;
 
     const PROFILES = {
         aggressive: {
-            startBuffer: 0.08,
-            startBehindEdge: 0.03,
-            hardSeekDrift: 0.40,
+            startBuffer: 0.10,
+            startBehindEdge: 0.04,
+            hardSeekDrift: 0.35,
             gentleDrift: 0.12,
-            gentleRate: 1.05,
-            trimTotalBuffer: 4.0,
-            trimBackBuffer: 2.5,
-            trimKeepBehind: 1.5,
-            waitRecoverDrift: 0.12,
+            gentleRate: 1.06,
+            trimTotalBuffer: 3.0,
+            trimBackBuffer: 2.0,
+            trimKeepBehind: 1.0,
+            waitRecoverDrift: 0.10,
             waitRecoverBehindEdge: 0.03,
-            waitCooldownMs: 350,
-            queueDropAt: 40,
-            queueKeep: 15
+            waitCooldownMs: 250,
+            queueDropAt: 30,
+            queueKeep: 10
         },
         balanced: {
-            startBuffer: 0.25,
-            startBehindEdge: 0.10,
-            hardSeekDrift: 0.70,
-            gentleDrift: 0.25,
-            gentleRate: 1.035,
-            trimTotalBuffer: 6.5,
+            startBuffer: 0.20,
+            startBehindEdge: 0.08,
+            hardSeekDrift: 0.55,
+            gentleDrift: 0.20,
+            gentleRate: 1.04,
+            trimTotalBuffer: 5.0,
+            trimBackBuffer: 3.0,
+            trimKeepBehind: 2.0,
+            waitRecoverDrift: 0.20,
+            waitRecoverBehindEdge: 0.05,
+            waitCooldownMs: 400,
+            queueDropAt: 45,
+            queueKeep: 20
+        },
+        stable: {
+            startBuffer: 0.35,
+            startBehindEdge: 0.12,
+            hardSeekDrift: 0.90,
+            gentleDrift: 0.40,
+            gentleRate: 1.025,
+            trimTotalBuffer: 6.0,
             trimBackBuffer: 4.0,
             trimKeepBehind: 3.0,
-            waitRecoverDrift: 0.25,
-            waitRecoverBehindEdge: 0.06,
+            waitRecoverDrift: 0.30,
+            waitRecoverBehindEdge: 0.08,
             waitCooldownMs: 600,
             queueDropAt: 60,
             queueKeep: 30
-        },
-        stable: {
-            startBuffer: 0.45,
-            startBehindEdge: 0.15,
-            hardSeekDrift: 1.2,
-            gentleDrift: 0.50,
-            gentleRate: 1.02,
-            trimTotalBuffer: 8.0,
-            trimBackBuffer: 5.0,
-            trimKeepBehind: 4.0,
-            waitRecoverDrift: 0.40,
-            waitRecoverBehindEdge: 0.10,
-            waitCooldownMs: 800,
-            queueDropAt: 80,
-            queueKeep: 40
         }
     };
 
@@ -173,14 +173,14 @@
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = Math.max(0, edge - video.currentTime);
-        driftEwma = driftEwma === 0 ? drift : (driftEwma * 0.80 + drift * 0.20);
+        driftEwma = driftEwma === 0 ? drift : (driftEwma * 0.75 + drift * 0.25);
 
         let next = activeProfile;
-        if (recentWaitingCount >= 4 || driftEwma > 1.5 || bufferQueue.length > 60) {
+        if (recentWaitingCount >= 3 || driftEwma > 1.2 || bufferQueue.length > 45) {
             next = 'stable';
-        } else if (recentWaitingCount >= 2 || driftEwma > 0.8 || bufferQueue.length > 40) {
+        } else if (recentWaitingCount >= 2 || driftEwma > 0.6 || bufferQueue.length > 30) {
             next = 'balanced';
-        } else if (recentWaitingCount === 0 && driftEwma < 0.35 && bufferQueue.length < 15) {
+        } else if (recentWaitingCount === 0 && driftEwma < 0.30 && bufferQueue.length < 10) {
             next = 'aggressive';
         }
 
@@ -267,7 +267,7 @@
                     initReceived = false;
                     startWebSocketStream(wsUrl);
                 }
-            }, 500);
+            }, 200);
         };
     }
 
@@ -313,8 +313,12 @@
             sourceBuffer.addEventListener('updateend', onUpdateEnd);
             sourceBuffer.addEventListener('error', (e) => {
                 report('SourceBuffer error event');
-                fatalError = true;
-                bufferQueue = [];
+                if (lastInitSeg) {
+                    setTimeout(() => reinitMSE(lastInitSeg), 300);
+                } else {
+                    fatalError = true;
+                    bufferQueue = [];
+                }
             });
 
             bufferQueue.unshift(initSeg);
@@ -385,7 +389,10 @@
             isAppending = false;
             if (e.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
                 try {
-                    sourceBuffer.remove(0, sourceBuffer.buffered.end(0) - 1);
+                    const removeEnd = Math.max(sourceBuffer.buffered.start(0), video.currentTime - 1.5);
+                    if (removeEnd > sourceBuffer.buffered.start(0)) {
+                        sourceBuffer.remove(sourceBuffer.buffered.start(0), removeEnd);
+                    }
                 } catch(re) {}
             }
         }
@@ -439,7 +446,7 @@
             const backBuffer = video.currentTime - start;
             const totalBuffered = edge - start;
 
-            if (totalBuffered > profile.trimTotalBuffer && backBuffer > profile.trimBackBuffer && nowMs - lastTrimMs > 1800) {
+            if (totalBuffered > profile.trimTotalBuffer && backBuffer > profile.trimBackBuffer && nowMs - lastTrimMs > 1200) {
                 const trimEnd = video.currentTime - profile.trimKeepBehind;
                 if (trimEnd > start) {
                     try {
@@ -454,21 +461,21 @@
     setInterval(() => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
         const nowMs = Date.now();
-        if (nowMs - lastControlTickMs > 600) {
+        if (nowMs - lastControlTickMs > 400) {
             lastControlTickMs = nowMs;
             updateAdaptiveProfile();
         }
 
-        if (sourceBuffer.buffered.length > 5 && lastInitSeg) {
-            report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+        if (sourceBuffer.buffered.length > 3 && lastInitSeg) {
+            report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) \u2014 reinit');
             reinitMSE(lastInitSeg);
             return;
         }
 
         const ct = video.currentTime;
         if (lastProgressCT >= 0 && Math.abs(ct - lastProgressCT) < 0.01) {
-            if (nowMs - lastProgressTime > 4000 && lastInitSeg) {
-                report('Stall detected (' + ct.toFixed(2) + 's for 4s) — reinit');
+            if (nowMs - lastProgressTime > 2500 && lastInitSeg) {
+                report('Stall detected (' + ct.toFixed(2) + 's for 2.5s) \u2014 reinit');
                 lastProgressCT = -1;
                 reinitMSE(lastInitSeg);
                 return;
@@ -498,7 +505,7 @@
         if (lastInitSeg) {
             report('Video error — reinit MSE');
             fatalError = false;
-            setTimeout(() => reinitMSE(lastInitSeg), 500);
+            setTimeout(() => reinitMSE(lastInitSeg), 150);
         } else {
             fatalError = true;
             bufferQueue = [];
@@ -514,15 +521,17 @@
         recentWaitingCount += 1;
         setTimeout(() => {
             recentWaitingCount = Math.max(0, recentWaitingCount - 1);
-        }, 4500);
+        }, 3000);
 
-        report('video waiting');
+        report('video waiting (count=' + recentWaitingCount + ')');
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             if (edge - video.currentTime > profile.waitRecoverDrift) {
                 video.currentTime = edge - profile.waitRecoverBehindEdge;
                 requestPlay('waiting');
                 report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
+            } else {
+                requestPlay('waiting-close');
             }
         }
     });
@@ -543,8 +552,9 @@
         report('video stalled bl=' + (sourceBuffer ? sourceBuffer.buffered.length : 0));
         if (sourceBuffer && sourceBuffer.buffered.length > 0) {
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            if (edge - video.currentTime > 0.2) {
+            if (edge - video.currentTime > 0.08) {
                 video.currentTime = edge - 0.02;
+                requestPlay('stalled');
             }
         }
     });
