@@ -9,7 +9,11 @@
             width: 100%; height: 100%;
             background: #000; overflow: hidden;
         }
-        video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+        video {
+            width: 100%; height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
         #welcome-img {
             display: none;
             position: fixed; top: 0; left: 0;
@@ -22,79 +26,62 @@
             position: fixed; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
             color: #fff; font: 24px -apple-system, sans-serif;
-            text-align: center; opacity: 0.8;
-            transition: opacity 0.5s;
+            text-align: center; opacity: 0;
+            transition: opacity 0.4s;
             z-index: 10;
+            pointer-events: none;
         }
+        #status.visible { opacity: 0.8; }
     </style>
 </head>
 <body>
-    <div id="status">Waiting for stream...</div>
+    <div id="status">Waiting for stream…</div>
     <img id="welcome-img" />
     <video id="v" autoplay muted playsinline></video>
     <script>
+    'use strict';
+
+    const NS  = 'urn:x-cast:com.screenmirror.stream';
     const TAG = '[SMReceiver]';
-    const NS = 'urn:x-cast:com.screenmirror.stream';
-    const statusEl = document.getElementById('status');
-    const video = document.getElementById('v');
+
+    const statusEl   = document.getElementById('status');
+    const video      = document.getElementById('v');
     const welcomeImg = document.getElementById('welcome-img');
 
     const ctx = cast.framework.CastReceiverContext.getInstance();
-    const pm = ctx.getPlayerManager();
+    const pm  = ctx.getPlayerManager();
     let senderBusId = null;
 
     function report(msg) {
         console.log(TAG, msg);
         if (senderBusId) {
-            try {
-                ctx.sendCustomMessage(NS, senderBusId, {type: 'DIAG', msg: msg});
-            } catch(e) {}
+            try { ctx.sendCustomMessage(NS, senderBusId, {type:'DIAG', msg:msg}); } catch(_){}
         }
     }
 
-    function setStatus(text, visible) {
-        if (typeof text === 'string') {
-            statusEl.textContent = text;
-        }
-        statusEl.style.opacity = visible ? '0.8' : '0';
-        statusEl.style.display = visible ? 'block' : 'none';
+    function showStatus(text) {
+        statusEl.textContent = text;
+        statusEl.classList.add('visible');
     }
-
-    function hideStatusIfRendering() {
-        if (video.readyState >= 2 || !video.paused) {
-            setStatus(null, false);
-        }
+    function hideStatus() {
+        statusEl.classList.remove('visible');
     }
 
     ctx.addCustomMessageListener(NS, event => {
         senderBusId = event.senderId;
-        console.log(TAG, 'Custom message from', event.senderId, ':', JSON.stringify(event.data));
-        if (event.data.type === 'START_STREAM') {
-            report('START_STREAM received: ' + event.data.wsUrl);
-            startWebSocketStream(event.data.wsUrl);
-        } else if (event.data.type === 'STOP_STREAM') {
-            stopStream();
-        } else if (event.data.type === 'SHOW_WELCOME') {
-            report('SHOW_WELCOME: ' + event.data.imageUrl);
-            showWelcome(event.data.imageUrl);
-        }
+        const d = event.data;
+        if (d.type === 'START_STREAM')       { report('START_STREAM: ' + d.wsUrl);     startStream(d.wsUrl); }
+        else if (d.type === 'STOP_STREAM')   { stopStream(); }
+        else if (d.type === 'SHOW_WELCOME')  { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
     });
 
-    pm.setMessageInterceptor(
-        cast.framework.messages.MessageType.LOAD,
-        loadRequest => {
-            try {
-                const hlsUrl = loadRequest.media.contentId;
-                report('LOAD intercepted: ' + hlsUrl);
-                const url = new URL(hlsUrl);
-                const wsUrl = 'ws://' + url.hostname + ':8082/stream';
-                startWebSocketStream(wsUrl);
-            } catch (e) {
-                report('LOAD intercept error: ' + e.message);
-            }
-            return null;
-        }
-    );
+    pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, req => {
+        try {
+            const url = new URL(req.media.contentId);
+            startStream('ws://' + url.hostname + ':8082/stream');
+        } catch(e) { report('LOAD error: ' + e.message); }
+        return null;
+    });
 
     const opts = new cast.framework.CastReceiverOptions();
     opts.disableIdleTimeout = true;
@@ -102,134 +89,39 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    console.log(TAG, 'Receiver v2 started');
+    report('Receiver v3 started');
 
-    let ws = null, mediaSource = null, sourceBuffer = null;
-    let bufferQueue = [], isAppending = false, initReceived = false;
-    let hasPlayed = false, appendCount = 0, firstFragmentDTS = -1;
-    let playRetryTimer = null, fatalError = false;
-    let lastTrimMs = 0, lastWaitingRecoveryMs = 0;
-    let recentWaitingCount = 0, lastControlTickMs = 0;
-    let driftEwma = 0.0, activeProfile = 'aggressive';
-    let playInFlight = false, lastPlayAttemptMs = 0, lastPlayRejectLogMs = 0;
-    let lastProgressTime = 0, lastProgressCT = -1;
+    let ws = null;
+    let mediaSource = null, sourceBuffer = null;
+    let queue = [], appending = false, initReceived = false;
     let lastInitSeg = null;
-    let lastReinitMs = 0;
-    const REINIT_COOLDOWN_MS = 2000;
+    let hasPlayed = false;
+    let statusTimer = null;
 
-    const PROFILES = {
-        aggressive: {
-            startBuffer: 0.01,
-            startBehindEdge: 0.00,
-            hardSeekDrift: 0.15,
-            gentleDrift: 0.10,
-            gentleRate: 1.0,
-            trimTotalBuffer: 1.5,
-            trimBackBuffer: 1.0,
-            trimKeepBehind: 0.5,
-            waitRecoverDrift: 0.05,
-            waitRecoverBehindEdge: 0.01,
-            waitCooldownMs: 200,
-            queueDropAt: 15,
-            queueKeep: 5
-        },
-        balanced: {
-            startBuffer: 0.03,
-            startBehindEdge: 0.01,
-            hardSeekDrift: 0.25,
-            gentleDrift: 0.15,
-            gentleRate: 1.0,
-            trimTotalBuffer: 2.0,
-            trimBackBuffer: 1.5,
-            trimKeepBehind: 1.0,
-            waitRecoverDrift: 0.10,
-            waitRecoverBehindEdge: 0.02,
-            waitCooldownMs: 300,
-            queueDropAt: 25,
-            queueKeep: 10
-        },
-        stable: {
-            startBuffer: 0.05,
-            startBehindEdge: 0.02,
-            hardSeekDrift: 0.40,
-            gentleDrift: 0.25,
-            gentleRate: 1.0,
-            trimTotalBuffer: 3.0,
-            trimBackBuffer: 2.0,
-            trimKeepBehind: 1.5,
-            waitRecoverDrift: 0.15,
-            waitRecoverBehindEdge: 0.05,
-            waitCooldownMs: 500,
-            queueDropAt: 40,
-            queueKeep: 15
-        }
-    };
+    const LATENCY_CHECK_MS    = 200;
+    const MAX_DRIFT_SEC       = 0.25;
+    const TRIM_INTERVAL_MS    = 2000;
+    const TRIM_KEEP_BEHIND    = 1.0;
+    const STALL_TIMEOUT_MS    = 5000;
+    const REINIT_COOLDOWN_MS  = 3000;
+    const QUEUE_MAX           = 20;
 
-    function currentProfile() {
-        return PROFILES[activeProfile] || PROFILES.balanced;
-    }
-
-    function updateAdaptiveProfile() {
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const drift = Math.max(0, edge - video.currentTime);
-        driftEwma = driftEwma === 0 ? drift : (driftEwma * 0.75 + drift * 0.25);
-
-        let next = activeProfile;
-        if (recentWaitingCount >= 3 || driftEwma > 1.2 || bufferQueue.length > 45) {
-            next = 'stable';
-        } else if (recentWaitingCount >= 2 || driftEwma > 0.6 || bufferQueue.length > 30) {
-            next = 'balanced';
-        } else if (recentWaitingCount === 0 && driftEwma < 0.30 && bufferQueue.length < 10) {
-            next = 'aggressive';
-        }
-
-        if (next !== activeProfile) {
-            activeProfile = next;
-            report('Adaptive profile -> ' + activeProfile + ' (drift=' + driftEwma.toFixed(2) + ', q=' + bufferQueue.length + ', waits=' + recentWaitingCount + ')');
-        }
-    }
+    let lastProgressTime = 0, lastProgressCT = -1;
+    let lastTrimTime = 0, lastReinitTime = 0;
+    let latencyTimer = null;
 
     function showWelcome(imageUrl) {
         stopStream();
         welcomeImg.src = imageUrl;
         welcomeImg.style.display = 'block';
         video.style.display = 'none';
-        setStatus(null, false);
+        hideStatus();
     }
 
-    function reinitMSE(initSeg) {
-        const nowMs = Date.now();
-        if (nowMs - lastReinitMs < REINIT_COOLDOWN_MS) {
-            report('reinit skipped (cooldown ' + (REINIT_COOLDOWN_MS - (nowMs - lastReinitMs)) + 'ms remaining)');
-            return;
-        }
-        lastReinitMs = nowMs;
-
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send("FORCE_KEYFRAME");
-            report('Sent FORCE_KEYFRAME to relay');
-        }
-
-        if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
-        if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(e) {}
-        }
-        mediaSource = null; sourceBuffer = null;
-        bufferQueue = []; isAppending = false;
-        hasPlayed = false; appendCount = 0; fatalError = false;
-        lastTrimMs = 0; lastWaitingRecoveryMs = 0;
-        recentWaitingCount = 0; lastControlTickMs = 0; driftEwma = 0.0; activeProfile = 'aggressive';
-        playInFlight = false; lastPlayAttemptMs = 0; lastPlayRejectLogMs = 0;
-        lastProgressCT = -1;
-        initMSE(initSeg);
-    }
-
-    function startWebSocketStream(wsUrl) {
+    function startStream(wsUrl) {
         welcomeImg.style.display = 'none';
         video.style.display = 'block';
-        report('Connecting to ' + wsUrl);
-        setStatus('Connecting...', true);
+        showStatus('Connecting…');
         stopStream();
 
         ws = new WebSocket(wsUrl);
@@ -237,62 +129,65 @@
 
         ws.onopen = () => {
             report('WebSocket connected');
-            setStatus('Buffering...', true);
-            setTimeout(() => {
-                hideStatusIfRendering();
-            }, 1200);
+            showStatus('Buffering…');
         };
 
-        ws.onmessage = (event) => {
-            const data = new Uint8Array(event.data);
+        ws.onmessage = (evt) => {
+            const data = new Uint8Array(evt.data);
+
             if (!initReceived) {
                 initReceived = true;
                 lastInitSeg = data;
                 report('Init segment: ' + data.length + ' bytes');
-                initMSE(data);
+                createMSE(data);
                 return;
             }
+
             if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
                 lastInitSeg = data;
-                report('Re-init segment (resolution change): ' + data.length + ' bytes');
-                reinitMSE(data);
+                report('Re-init (resolution change): ' + data.length + ' bytes');
+                reinitMSE();
                 return;
             }
-            appendToBuffer(data);
+            enqueue(data);
         };
 
-        ws.onerror = (e) => {
+        ws.onerror = () => {
             report('WS error');
-            setStatus('Connection error', true);
+            showStatus('Connection error');
         };
 
         ws.onclose = () => {
-            report('WS closed, reconnecting...');
+            report('WS closed');
+            const url = wsUrl;
             setTimeout(() => {
-                if (ws && ws.readyState === WebSocket.CLOSED) {
+                if (!ws || ws.readyState === WebSocket.CLOSED) {
                     initReceived = false;
-                    startWebSocketStream(wsUrl);
+                    startStream(url);
                 }
-            }, 200);
+            }, 300);
         };
     }
 
     function stopStream() {
-        if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
-        if (ws) { ws.onclose = null; ws.close(); ws = null; }
+        if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
+        if (statusTimer)  { clearInterval(statusTimer);  statusTimer = null; }
+        if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
+
         if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(e) {}
+            try { mediaSource.endOfStream(); } catch(_){}
         }
-        mediaSource = null; sourceBuffer = null;
-        bufferQueue = []; isAppending = false; initReceived = false;
-        hasPlayed = false; appendCount = 0; firstFragmentDTS = -1; fatalError = false;
-        lastTrimMs = 0; lastWaitingRecoveryMs = 0;
-        recentWaitingCount = 0; lastControlTickMs = 0; driftEwma = 0.0; activeProfile = 'aggressive';
-        playInFlight = false; lastPlayAttemptMs = 0; lastPlayRejectLogMs = 0;
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        initReceived = false;
+        hasPlayed = false;
         lastProgressCT = -1;
+        lastProgressTime = 0;
     }
 
-    function initMSE(initSeg) {
+    function createMSE(initSeg) {
         mediaSource = new MediaSource();
 
         mediaSource.addEventListener('sourceopen', () => {
@@ -302,289 +197,219 @@
 
             try {
                 sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
-                sourceBuffer.mode = 'sequence';
-                report('SourceBuffer created OK (sequence mode)');
-            } catch (e) {
-                report('addSourceBuffer failed with ' + codec + ': ' + e.message);
+            } catch(e) {
+                report('addSourceBuffer failed: ' + e.message + ' — trying baseline');
                 try {
                     sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
-                    sourceBuffer.mode = 'sequence';
-                    report('Fallback SourceBuffer created (Baseline, sequence mode)');
-                } catch (e2) {
-                    report('Fallback addSourceBuffer also failed: ' + e2.message);
+                } catch(e2) {
+                    report('Baseline also failed: ' + e2.message);
                     return;
                 }
             }
 
+            sourceBuffer.mode = 'sequence';
             sourceBuffer.addEventListener('updateend', onUpdateEnd);
-            sourceBuffer.addEventListener('error', (e) => {
-                report('SourceBuffer error event');
-                if (lastInitSeg) {
-                    setTimeout(() => reinitMSE(lastInitSeg), 300);
-                } else {
-                    fatalError = true;
-                    bufferQueue = [];
-                }
+            sourceBuffer.addEventListener('error', () => {
+                report('SourceBuffer error');
+                reinitMSE();
             });
 
-            bufferQueue.unshift(initSeg);
+            queue.unshift(initSeg);
             drainQueue();
 
-            playRetryTimer = setInterval(() => {
-                tryPlay();
-                if (sourceBuffer && !hasPlayed) {
-                    const bl = sourceBuffer.buffered.length;
-                    const vp = video.paused;
-                    const ct = video.currentTime.toFixed(2);
-                    const re = video.readyState;
-                    report('status: buffered=' + bl + ' paused=' + vp + ' time=' + ct + ' readyState=' + re + ' appends=' + appendCount + ' qLen=' + bufferQueue.length);
+            startLatencyController();
+
+            statusTimer = setInterval(() => {
+                attemptPlay();
+                if (hasPlayed && statusTimer) {
+                    clearInterval(statusTimer);
+                    statusTimer = null;
                 }
-            }, 500);
+            }, 100);
         });
 
         mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
         mediaSource.addEventListener('sourceclose', () => report('MSE sourceclose'));
 
         video.src = URL.createObjectURL(mediaSource);
-        report('video.src set, waiting for sourceopen...');
+        report('video.src set, waiting for sourceopen…');
     }
 
-    function onUpdateEnd() {
-        isAppending = false;
-        appendCount++;
-        if (appendCount <= 3) {
-            const bl = sourceBuffer.buffered.length;
-            let info = 'updateend #' + appendCount + ' buffered.length=' + bl;
-            if (bl > 0) {
-                info += ' range=[' + sourceBuffer.buffered.start(0).toFixed(3) + ',' + sourceBuffer.buffered.end(0).toFixed(3) + ']';
-            }
-            report(info);
+    function reinitMSE() {
+        const now = Date.now();
+        if (now - lastReinitTime < REINIT_COOLDOWN_MS) return;
+        lastReinitTime = now;
+
+        report('reinitMSE');
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send('FORCE_KEYFRAME');
         }
-        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
-            setStatus(null, false);
+
+        if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
+        if (statusTimer)  { clearInterval(statusTimer);  statusTimer = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
         }
-        drainQueue();
-        tryPlay();
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        hasPlayed = false;
+        lastProgressCT = -1;
+
+        if (lastInitSeg) {
+            createMSE(lastInitSeg);
+        }
     }
 
-    function appendToBuffer(data) {
-        const profile = currentProfile();
-        if (bufferQueue.length > profile.queueDropAt) {
-            let dropped = 0;
-            const keep = [];
-            for (let i = bufferQueue.length - profile.queueKeep; i < bufferQueue.length; i++) {
-                if (i >= 0) keep.push(bufferQueue[i]);
-            }
-            dropped = bufferQueue.length - keep.length;
-            bufferQueue = keep;
-            if (dropped > 0) report('Dropped ' + dropped + ' queued fragments (queue overflow)');
+    function enqueue(data) {
+        if (queue.length >= QUEUE_MAX) {
+            const drop = queue.length - Math.floor(QUEUE_MAX / 2);
+            queue.splice(0, drop);
+            report('Dropped ' + drop + ' queued fragments');
         }
-        bufferQueue.push(data);
+        queue.push(data);
         drainQueue();
     }
 
     function drainQueue() {
-        if (fatalError || isAppending || !sourceBuffer || bufferQueue.length === 0) return;
+        if (appending || !sourceBuffer || queue.length === 0) return;
         if (sourceBuffer.updating) return;
-        isAppending = true;
-        const chunk = bufferQueue.shift();
+        appending = true;
+        const chunk = queue.shift();
         try {
             sourceBuffer.appendBuffer(chunk);
-        } catch (e) {
-            report('appendBuffer error: ' + e.name + ' ' + e.message);
-            isAppending = false;
-            if (e.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
-                try {
-                    const removeEnd = Math.max(sourceBuffer.buffered.start(0), video.currentTime - 1.5);
-                    if (removeEnd > sourceBuffer.buffered.start(0)) {
-                        sourceBuffer.remove(sourceBuffer.buffered.start(0), removeEnd);
-                    }
-                } catch(re) {}
+        } catch(e) {
+            appending = false;
+            report('appendBuffer error: ' + e.name);
+            if (e.name === 'QuotaExceededError') {
+                emergencyTrim();
             }
         }
     }
 
-    function requestPlay(reason) {
-        const nowMs = Date.now();
-        if (playInFlight) return;
-        if (!video.paused) return;
-        if (nowMs - lastPlayAttemptMs < 150) return;
+    function onUpdateEnd() {
+        appending = false;
+        drainQueue();
 
-        lastPlayAttemptMs = nowMs;
-        playInFlight = true;
+        if (!hasPlayed && sourceBuffer && sourceBuffer.buffered.length > 0) {
+            attemptPlay();
+        }
+    }
+
+    function attemptPlay() {
+        if (hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const start = sourceBuffer.buffered.start(0);
+        if (edge - start < 0.06) return;
+
+        video.currentTime = Math.max(0, edge - 0.02);
 
         video.play().then(() => {
-            playInFlight = false;
-            if (!hasPlayed) {
-                hasPlayed = true;
-                report('PLAYING! time=' + video.currentTime.toFixed(2));
-                setStatus(null, false);
-                if (playRetryTimer) { clearInterval(playRetryTimer); playRetryTimer = null; }
+            hasPlayed = true;
+            hideStatus();
+            report('PLAYING time=' + video.currentTime.toFixed(3));
+        }).catch(e => {
+            if (e && e.name !== 'AbortError') {
+                report('play() error: ' + e.name + ' ' + (e.message || ''));
             }
-        }).catch((e) => {
-            playInFlight = false;
-            if (e && e.name === 'AbortError') {
-                if (nowMs - lastPlayRejectLogMs > 2000) {
-                    lastPlayRejectLogMs = nowMs;
-                    report('play() rejected (AbortError) during ' + reason);
-                }
-                return;
-            }
-            report('play() rejected: ' + (e ? e.name : 'Error') + ' ' + (e && e.message ? e.message : ''));
         });
     }
 
-    function tryPlay() {
-        if (!sourceBuffer) return;
-        const profile = currentProfile();
-        if (video.paused && sourceBuffer.buffered.length > 0) {
-            const start = sourceBuffer.buffered.start(0);
+    function startLatencyController() {
+        lastProgressTime = Date.now();
+        lastProgressCT = -1;
+
+        latencyTimer = setInterval(() => {
+            if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+            if (video.paused && hasPlayed) {
+                video.play().catch(() => {});
+            }
+            if (video.paused) return;
+
+            const now = Date.now();
+            const ct  = video.currentTime;
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            const bufferedAhead = edge - start;
-            if (bufferedAhead < profile.startBuffer) return;
-            video.currentTime = Math.max(0, edge - profile.startBehindEdge);
-            requestPlay('tryPlay');
-        } else if (!video.paused && sourceBuffer.buffered.length > 0) {
-            if (video.readyState <= 2) {
-                const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-                if (edge - video.currentTime > 0.05) {
-                    video.currentTime = edge - profile.startBehindEdge;
-                    requestPlay('nudge-resume');
+
+            const drift = edge - ct;
+            if (drift > MAX_DRIFT_SEC) {
+                video.currentTime = edge - 0.02;
+            }
+
+            if (Math.abs(ct - lastProgressCT) > 0.005) {
+                lastProgressTime = now;
+                lastProgressCT = ct;
+            } else {
+                const stuckFor = now - lastProgressTime;
+                const hasDataAhead = (edge - ct) > 0.1;
+                if (stuckFor > STALL_TIMEOUT_MS && hasDataAhead) {
+                    report('Stall: ' + ct.toFixed(2) + 's for ' + (stuckFor/1000).toFixed(1) + 's — reinit');
+                    lastProgressCT = -1;
+                    reinitMSE();
+                    return;
                 }
             }
 
-            if (!sourceBuffer.updating) {
-                const nowMs = Date.now();
-                const start = sourceBuffer.buffered.start(0);
-                const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-                const backBuffer = video.currentTime - start;
-                const totalBuffered = edge - start;
-
-                if (totalBuffered > profile.trimTotalBuffer && backBuffer > profile.trimBackBuffer && nowMs - lastTrimMs > 1200) {
-                    const trimEnd = video.currentTime - profile.trimKeepBehind;
-                    if (trimEnd > start) {
-                        try {
-                            sourceBuffer.remove(start, trimEnd);
-                            lastTrimMs = nowMs;
-                        } catch(e) {}
-                    }
+            if (now - lastTrimTime > TRIM_INTERVAL_MS && !sourceBuffer.updating) {
+                const removeEnd = ct - TRIM_KEEP_BEHIND;
+                const bufStart = sourceBuffer.buffered.start(0);
+                if (removeEnd > bufStart + 0.1) {
+                    try {
+                        sourceBuffer.remove(bufStart, removeEnd);
+                        lastTrimTime = now;
+                    } catch(_) {}
                 }
             }
-        }
+
+            if (sourceBuffer.buffered.length > 2) {
+                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+                reinitMSE();
+            }
+        }, LATENCY_CHECK_MS);
     }
 
-    setInterval(() => {
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0 || video.paused) return;
-        const nowMs = Date.now();
-        if (nowMs - lastControlTickMs > 400) {
-            lastControlTickMs = nowMs;
-            updateAdaptiveProfile();
-        }
+    function emergencyTrim() {
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        try {
+            const start = sourceBuffer.buffered.start(0);
+            const end = Math.max(start, video.currentTime - 0.5);
+            if (end > start) sourceBuffer.remove(start, end);
+        } catch(_) {}
+    }
 
-        if (sourceBuffer.buffered.length > 3 && lastInitSeg) {
-            report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) \u2014 reinit');
-            reinitMSE(lastInitSeg);
-            return;
-        }
-
-        const ct = video.currentTime;
-        if (lastProgressCT >= 0 && Math.abs(ct - lastProgressCT) < 0.01) {
-            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            const isAtEdge = (edge - ct) < 0.1;
-            
-            if (nowMs - lastProgressTime > 2500 && lastInitSeg && !isAtEdge) {
-                report('Stall detected (' + ct.toFixed(2) + 's for 2.5s, edge=' + edge.toFixed(2) + ') \u2014 reinit');
-                lastProgressCT = -1;
-                reinitMSE(lastInitSeg);
-                return;
-            }
-        } else {
-            lastProgressTime = nowMs;
-            lastProgressCT = ct;
-        }
-
-        const profile = currentProfile();
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const drift = edge - video.currentTime;
-        
-        if (drift > profile.hardSeekDrift) {
-            video.currentTime = edge - profile.startBehindEdge;
-            video.playbackRate = 1.0;
-        } else {
-            video.playbackRate = 1.0;
-        }
-    }, 100);
-
-    video.addEventListener('error', (e) => {
-        const err = video.error;
-        report('video error: code=' + (err ? err.code : '?') + ' msg=' + (err ? err.message : '?'));
-        if (lastInitSeg) {
-            report('Video error — reinit MSE');
-            fatalError = false;
-            setTimeout(() => reinitMSE(lastInitSeg), 150);
-        } else {
-            fatalError = true;
-            bufferQueue = [];
-        }
-    });
     video.addEventListener('waiting', () => {
-        if (!hasPlayed) return;
-        const profile = currentProfile();
-        const nowMs = Date.now();
-        if (nowMs - lastWaitingRecoveryMs < profile.waitCooldownMs) return;
-        lastWaitingRecoveryMs = nowMs;
-
-        recentWaitingCount += 1;
-        setTimeout(() => {
-            recentWaitingCount = Math.max(0, recentWaitingCount - 1);
-        }, 3000);
-
-        report('video waiting (count=' + recentWaitingCount + ')');
-        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
-            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            if (edge - video.currentTime > profile.waitRecoverDrift) {
-                video.currentTime = edge - profile.waitRecoverBehindEdge;
-                requestPlay('waiting');
-                report('waiting recovery: seek to ' + video.currentTime.toFixed(3));
-            } else {
-                requestPlay('waiting-close');
-            }
+        if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 0.05) {
+            video.currentTime = edge - 0.02;
+            report('waiting → seek to edge ' + edge.toFixed(3));
         }
     });
-    video.addEventListener('playing', () => {
-        playInFlight = false;
-        setStatus(null, false);
-    });
-    video.addEventListener('timeupdate', () => {
-        hideStatusIfRendering();
-    });
-    video.addEventListener('canplay', () => {
-        hideStatusIfRendering();
-    });
-    video.addEventListener('loadeddata', () => {
-        hideStatusIfRendering();
-    });
+
     video.addEventListener('stalled', () => {
-        report('video stalled bl=' + (sourceBuffer ? sourceBuffer.buffered.length : 0));
-        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
-            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            if (edge - video.currentTime > 0.08) {
-                video.currentTime = edge - 0.02;
-                requestPlay('stalled');
-            }
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 0.05) {
+            video.currentTime = edge - 0.02;
         }
     });
-    setInterval(() => {
-        if (video.currentTime > 0.2 && !video.paused) {
-            setStatus(null, false);
-        }
-    }, 1000);
+
+    video.addEventListener('error', () => {
+        const err = video.error;
+        report('video error: code=' + (err ? err.code : '?'));
+        if (lastInitSeg) reinitMSE();
+    });
+
+    video.addEventListener('playing', () => hideStatus());
+    video.addEventListener('timeupdate', () => { if (hasPlayed) hideStatus(); });
 
     function detectCodec(d) {
         for (let i = 0; i < d.length - 8; i++) {
             if (d[i]===0x61 && d[i+1]===0x76 && d[i+2]===0x63 && d[i+3]===0x43) {
                 if (d[i+4] === 1 && i+7 < d.length) {
-                    const h = n => n.toString(16).padStart(2,'0');
+                    const h = n => n.toString(16).padStart(2, '0');
                     return 'avc1.' + h(d[i+5]) + h(d[i+6]) + h(d[i+7]);
                 }
             }
