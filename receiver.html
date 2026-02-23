@@ -119,49 +119,49 @@
 
     const PROFILES = {
         aggressive: {
-            startBuffer: 0.02,
-            startBehindEdge: 0.01,
-            hardSeekDrift: 0.35,
-            gentleDrift: 0.12,
-            gentleRate: 1.06,
-            trimTotalBuffer: 3.0,
-            trimBackBuffer: 2.0,
-            trimKeepBehind: 1.0,
-            waitRecoverDrift: 0.10,
-            waitRecoverBehindEdge: 0.03,
-            waitCooldownMs: 250,
-            queueDropAt: 30,
-            queueKeep: 10
+            startBuffer: 0.01,
+            startBehindEdge: 0.00,
+            hardSeekDrift: 0.15,
+            gentleDrift: 0.10,
+            gentleRate: 1.0,
+            trimTotalBuffer: 1.5,
+            trimBackBuffer: 1.0,
+            trimKeepBehind: 0.5,
+            waitRecoverDrift: 0.05,
+            waitRecoverBehindEdge: 0.01,
+            waitCooldownMs: 200,
+            queueDropAt: 15,
+            queueKeep: 5
         },
         balanced: {
-            startBuffer: 0.05,
-            startBehindEdge: 0.02,
-            hardSeekDrift: 0.55,
-            gentleDrift: 0.20,
-            gentleRate: 1.04,
-            trimTotalBuffer: 5.0,
-            trimBackBuffer: 3.0,
-            trimKeepBehind: 2.0,
-            waitRecoverDrift: 0.20,
-            waitRecoverBehindEdge: 0.05,
-            waitCooldownMs: 400,
-            queueDropAt: 45,
-            queueKeep: 20
+            startBuffer: 0.03,
+            startBehindEdge: 0.01,
+            hardSeekDrift: 0.25,
+            gentleDrift: 0.15,
+            gentleRate: 1.0,
+            trimTotalBuffer: 2.0,
+            trimBackBuffer: 1.5,
+            trimKeepBehind: 1.0,
+            waitRecoverDrift: 0.10,
+            waitRecoverBehindEdge: 0.02,
+            waitCooldownMs: 300,
+            queueDropAt: 25,
+            queueKeep: 10
         },
         stable: {
-            startBuffer: 0.10,
-            startBehindEdge: 0.05,
-            hardSeekDrift: 0.90,
-            gentleDrift: 0.40,
-            gentleRate: 1.025,
-            trimTotalBuffer: 6.0,
-            trimBackBuffer: 4.0,
-            trimKeepBehind: 3.0,
-            waitRecoverDrift: 0.30,
-            waitRecoverBehindEdge: 0.08,
-            waitCooldownMs: 600,
-            queueDropAt: 60,
-            queueKeep: 30
+            startBuffer: 0.05,
+            startBehindEdge: 0.02,
+            hardSeekDrift: 0.40,
+            gentleDrift: 0.25,
+            gentleRate: 1.0,
+            trimTotalBuffer: 3.0,
+            trimBackBuffer: 2.0,
+            trimKeepBehind: 1.5,
+            waitRecoverDrift: 0.15,
+            waitRecoverBehindEdge: 0.05,
+            waitCooldownMs: 500,
+            queueDropAt: 40,
+            queueKeep: 15
         }
     };
 
@@ -506,16 +506,14 @@
         const profile = currentProfile();
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
+        
         if (drift > profile.hardSeekDrift) {
             video.currentTime = edge - profile.startBehindEdge;
             video.playbackRate = 1.0;
-        } else if (drift > profile.gentleDrift) {
-            const queueBoost = bufferQueue.length > 25 ? 0.015 : 0.0;
-            video.playbackRate = Math.min(1.08, profile.gentleRate + queueBoost);
         } else {
             video.playbackRate = 1.0;
         }
-    }, 150);
+    }, 100);
 
     video.addEventListener('error', (e) => {
         const err = video.error;
