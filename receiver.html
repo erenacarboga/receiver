@@ -125,6 +125,7 @@
     let latencyTimer = null;
     let appendErrorCount = 0;
     let lastWaitingSeek = 0;
+    let playPending = false;
     let diagTimer = null;
     let totalBytesReceived = 0;
     let fragmentsReceived = 0;
@@ -213,6 +214,7 @@
         lastProgressCT = -1;
         lastProgressTime = 0;
         appendErrorCount = 0;
+        playPending = false;
         if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
         totalBytesReceived = 0;
         fragmentsReceived = 0;
@@ -354,29 +356,34 @@
     }
 
     function attemptPlay() {
-        if (hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        if (hasPlayed || playPending || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
 
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const start = sourceBuffer.buffered.start(0);
         if (edge - start < 0.03) return;
 
+        playPending = true;
         report('attemptPlay: buf=' + start.toFixed(3) + '-' + edge.toFixed(3)
             + ' muted=' + video.muted + ' rs=' + video.readyState);
 
         video.play().then(() => {
+            playPending = false;
             hasPlayed = true;
             hideStatus();
             report('PLAYING time=' + video.currentTime.toFixed(3));
         }).catch(e => {
+            playPending = false;
             report('play() error: ' + (e ? e.name + ' ' + (e.message || '') : 'unknown'));
             if (!video.muted) {
+                playPending = true;
                 video.muted = true;
                 video.play().then(() => {
+                    playPending = false;
                     hasPlayed = true;
                     hideStatus();
                     video.muted = false;
                     report('PLAYING (muted-workaround) time=' + video.currentTime.toFixed(3));
-                }).catch(() => {});
+                }).catch(() => { playPending = false; });
             }
         });
     }
