@@ -111,17 +111,20 @@
     let statusTimer = null;
 
     const LATENCY_CHECK_MS    = 200;
-    const MAX_DRIFT_SEC       = 0.25;
+    const MAX_DRIFT_SEC       = 0.8;
     const TRIM_INTERVAL_MS    = 2000;
-    const TRIM_KEEP_BEHIND    = 1.0;
+    const TRIM_KEEP_BEHIND    = 2.0;
     const STALL_TIMEOUT_MS    = 5000;
     const REINIT_COOLDOWN_MS  = 3000;
-    const QUEUE_MAX           = 20;
+    const QUEUE_MAX           = 30;
+    const SEEK_BEHIND         = 0.15;
+    const WAITING_THROTTLE_MS = 500;
 
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastTrimTime = 0, lastReinitTime = 0;
     let latencyTimer = null;
     let appendErrorCount = 0;
+    let lastWaitingSeek = 0;
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -366,7 +369,7 @@
 
             const drift = edge - ct;
             if (drift > MAX_DRIFT_SEC) {
-                video.currentTime = edge - 0.02;
+                video.currentTime = edge - SEEK_BEHIND;
             }
 
             if (Math.abs(ct - lastProgressCT) > 0.005) {
@@ -394,7 +397,7 @@
                 }
             }
 
-            if (sourceBuffer.buffered.length > 2) {
+            if (sourceBuffer.buffered.length > 4) {
                 report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
                 reinitMSE();
             }
@@ -412,18 +415,24 @@
 
     video.addEventListener('waiting', () => {
         if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const now = Date.now();
+        if (now - lastWaitingSeek < WAITING_THROTTLE_MS) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.05) {
-            video.currentTime = edge - 0.02;
+        if (edge - video.currentTime > 0.1) {
+            video.currentTime = edge - SEEK_BEHIND;
+            lastWaitingSeek = now;
             report('waiting → seek to edge ' + edge.toFixed(3));
         }
     });
 
     video.addEventListener('stalled', () => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const now = Date.now();
+        if (now - lastWaitingSeek < WAITING_THROTTLE_MS) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.05) {
-            video.currentTime = edge - 0.02;
+        if (edge - video.currentTime > 0.1) {
+            video.currentTime = edge - SEEK_BEHIND;
+            lastWaitingSeek = now;
         }
     });
 
