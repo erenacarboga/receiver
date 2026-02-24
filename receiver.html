@@ -126,15 +126,15 @@
     let hasPlayed = false;
     let statusTimer = null;
 
-    const LATENCY_CHECK_MS    = 100;
-    const MAX_DRIFT_SEC       = 0.4;
-    const TRIM_INTERVAL_MS    = 1500;
-    const TRIM_KEEP_BEHIND    = 1.0;
-    const STALL_TIMEOUT_MS    = 3000;
+    const LATENCY_CHECK_MS    = 80;
+    const MAX_DRIFT_SEC       = 0.15;
+    const TRIM_INTERVAL_MS    = 800;
+    const TRIM_KEEP_BEHIND    = 0.3;
+    const STALL_TIMEOUT_MS    = 1500;
     const REINIT_COOLDOWN_MS  = 2000;
-    const QUEUE_MAX           = 15;
-    const SEEK_BEHIND         = 0.05;
-    const WAITING_THROTTLE_MS = 250;
+    const QUEUE_MAX           = 8;
+    const SEEK_BEHIND         = 0.02;
+    const WAITING_THROTTLE_MS = 100;
 
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastTrimTime = 0, lastReinitTime = 0;
@@ -673,6 +673,11 @@
             const drift = edge - ct;
             if (drift > MAX_DRIFT_SEC) {
                 video.currentTime = edge - SEEK_BEHIND;
+                video.playbackRate = 1.0;
+            } else if (drift > 0.08) {
+                video.playbackRate = 1.05;
+            } else {
+                video.playbackRate = 1.0;
             }
 
             if (Math.abs(ct - lastProgressCT) > 0.005) {
@@ -721,7 +726,7 @@
         const now = Date.now();
         if (now - lastWaitingSeek < WAITING_THROTTLE_MS) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.1) {
+        if (edge - video.currentTime > 0.03) {
             video.currentTime = edge - SEEK_BEHIND;
             lastWaitingSeek = now;
             seekCount++;
@@ -735,7 +740,7 @@
         const now = Date.now();
         if (now - lastWaitingSeek < WAITING_THROTTLE_MS) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.1) {
+        if (edge - video.currentTime > 0.03) {
             video.currentTime = edge - SEEK_BEHIND;
             lastWaitingSeek = now;
         }
