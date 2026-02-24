@@ -3,6 +3,7 @@
 <head>
     <meta charset="utf-8">
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
     <style>
         html, body {
             margin: 0; padding: 0;
@@ -80,6 +81,11 @@
             startStream(d.wsUrl);
         }
         else if (d.type === 'STOP_STREAM')   { stopStream(); }
+        else if (d.type === 'PLAY_HLS')      {
+            report('PLAY_HLS: ' + d.hlsUrl + ' sound=' + d.soundEnabled);
+            video.muted = (d.soundEnabled === false);
+            playHLS(d.hlsUrl);
+        }
         else if (d.type === 'SHOW_WELCOME')  { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
         else if (d.type === 'SET_SOUND')     {
             report('SET_SOUND: ' + d.enabled);
@@ -105,6 +111,8 @@
 
     let ws = null;
     let mediaSource = null, sourceBuffer = null;
+    let hlsInstance = null;
+    let hlsLiveEdgeTimer = null;
     let queue = [], appending = false, initReceived = false;
     let lastInitSeg = null;
     let hasPlayed = false;
@@ -197,7 +205,102 @@
         };
     }
 
+    function stopHLS() {
+        if (hlsLiveEdgeTimer) { clearInterval(hlsLiveEdgeTimer); hlsLiveEdgeTimer = null; }
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+    }
+
+    function playHLS(hlsUrl) {
+        stopStream();
+        stopHLS();
+        welcomeImg.style.display = 'none';
+        video.style.display = 'block';
+        showStatus('Buffering…');
+
+        if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+            hlsInstance = new Hls({
+                liveSyncDurationCount: 1,
+                liveMaxLatencyDurationCount: 3,
+                lowLatencyMode: true,
+                maxBufferLength: 1,
+                maxMaxBufferLength: 3,
+                maxBufferHole: 0.5,
+                backBufferLength: 0,
+                enableWorker: true,
+                startFragPrefetch: true,
+                manifestLoadingTimeOut: 15000,
+                manifestLoadingMaxRetry: 50,
+                manifestLoadingRetryDelay: 500,
+                levelLoadingTimeOut: 15000,
+                levelLoadingMaxRetry: 50,
+                levelLoadingRetryDelay: 500,
+                fragLoadingTimeOut: 15000,
+                fragLoadingMaxRetry: 50,
+                fragLoadingRetryDelay: 300,
+            });
+            hlsInstance.loadSource(hlsUrl);
+            hlsInstance.attachMedia(video);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                report('HLS manifest parsed, starting playback');
+                video.play().then(() => {
+                    hasPlayed = true;
+                    hideStatus();
+                    report('HLS PLAYING');
+                }).catch(e => {
+                    report('HLS play() error: ' + (e ? e.message : 'unknown') + ', trying muted');
+                    video.muted = true;
+                    video.play().then(() => {
+                        hasPlayed = true;
+                        hideStatus();
+                        report('HLS PLAYING (muted fallback)');
+                    }).catch(() => {});
+                });
+            });
+            hlsInstance.on(Hls.Events.ERROR, (e, data) => {
+                report('HLS error: ' + data.type + '/' + data.details + ' fatal=' + data.fatal);
+                if (data.fatal) {
+                    switch (data.type) {
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            report('HLS fatal network error, retrying...');
+                            hlsInstance.startLoad();
+                            break;
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            report('HLS fatal media error, recovering...');
+                            hlsInstance.recoverMediaError();
+                            break;
+                        default:
+                            report('HLS unrecoverable error, restarting...');
+                            stopHLS();
+                            setTimeout(() => playHLS(hlsUrl), 2000);
+                            break;
+                    }
+                }
+            });
+            hlsLiveEdgeTimer = setInterval(() => {
+                if (hlsInstance && hlsInstance.liveSyncPosition != null && video.readyState >= 2) {
+                    const behind = hlsInstance.liveSyncPosition - video.currentTime;
+                    if (behind > 2.0) {
+                        video.currentTime = hlsInstance.liveSyncPosition;
+                        report('HLS snap to live edge, was ' + behind.toFixed(1) + 's behind');
+                    }
+                }
+            }, 2000);
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = hlsUrl;
+            video.addEventListener('loadedmetadata', () => {
+                video.play().catch(() => {});
+                hasPlayed = true;
+                hideStatus();
+                report('HLS PLAYING (native)');
+            });
+        } else {
+            showStatus('HLS not supported');
+            report('HLS NOT SUPPORTED on this device');
+        }
+    }
+
     function stopStream() {
+        stopHLS();
         if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
         if (statusTimer)  { clearInterval(statusTimer);  statusTimer = null; }
         if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
