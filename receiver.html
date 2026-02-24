@@ -121,6 +121,7 @@
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastTrimTime = 0, lastReinitTime = 0;
     let latencyTimer = null;
+    let appendErrorCount = 0;
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -197,25 +198,32 @@
         hasPlayed = false;
         lastProgressCT = -1;
         lastProgressTime = 0;
+        appendErrorCount = 0;
     }
 
     function createMSE(initSeg) {
         mediaSource = new MediaSource();
+        appendErrorCount = 0;
 
         mediaSource.addEventListener('sourceopen', () => {
             report('MSE sourceopen');
-            const codec = detectCodec(initSeg) || 'avc1.640029';
+            const codec = detectCodec(initSeg) || 'avc1.640029,mp4a.40.2';
             report('Codec: ' + codec);
 
             try {
                 sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
             } catch(e) {
-                report('addSourceBuffer failed: ' + e.message + ' — trying baseline');
+                report('addSourceBuffer failed: ' + e.message + ' — trying baseline muxed');
                 try {
-                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E,mp4a.40.2"');
                 } catch(e2) {
-                    report('Baseline also failed: ' + e2.message);
-                    return;
+                    report('Baseline muxed also failed: ' + e2.message + ' — trying video-only');
+                    try {
+                        sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                    } catch(e3) {
+                        report('All codec attempts failed');
+                        return;
+                    }
                 }
             }
 
@@ -223,6 +231,8 @@
             sourceBuffer.addEventListener('updateend', onUpdateEnd);
             sourceBuffer.addEventListener('error', () => {
                 report('SourceBuffer error');
+                queue = [];
+                appending = false;
                 reinitMSE();
             });
 
@@ -288,15 +298,27 @@
     function drainQueue() {
         if (appending || !sourceBuffer || queue.length === 0) return;
         if (sourceBuffer.updating) return;
+        if (!mediaSource || mediaSource.readyState !== 'open') {
+            queue = [];
+            return;
+        }
         appending = true;
         const chunk = queue.shift();
         try {
             sourceBuffer.appendBuffer(chunk);
+            appendErrorCount = 0;
         } catch(e) {
             appending = false;
-            report('appendBuffer error: ' + e.name);
+            if (appendErrorCount < 5) {
+                report('appendBuffer error: ' + e.name);
+            } else if (appendErrorCount === 5) {
+                report('appendBuffer errors suppressed (' + appendErrorCount + '+)');
+            }
+            appendErrorCount++;
             if (e.name === 'QuotaExceededError') {
                 emergencyTrim();
+            } else if (e.name === 'InvalidStateError') {
+                queue = [];
             }
         }
     }
@@ -431,9 +453,10 @@
     function detectCodec(d) {
         let videoCodec = null;
         let hasAudio = false;
-        for (let i = 0; i < d.length - 8; i++) {
-            if (d[i]===0x61 && d[i+1]===0x76 && d[i+2]===0x63 && d[i+3]===0x43) {
-                if (d[i+4] === 1 && i+7 < d.length) {
+        for (let i = 0; i < d.length - 4; i++) {
+            if (!videoCodec && i + 7 < d.length &&
+                d[i]===0x61 && d[i+1]===0x76 && d[i+2]===0x63 && d[i+3]===0x43) {
+                if (d[i+4] === 1) {
                     const h = n => n.toString(16).padStart(2, '0');
                     videoCodec = 'avc1.' + h(d[i+5]) + h(d[i+6]) + h(d[i+7]);
                 }
@@ -441,8 +464,14 @@
             if (d[i]===0x6D && d[i+1]===0x70 && d[i+2]===0x34 && d[i+3]===0x61) {
                 hasAudio = true;
             }
+            if (d[i]===0x65 && d[i+1]===0x73 && d[i+2]===0x64 && d[i+3]===0x73) {
+                hasAudio = true;
+            }
         }
         if (videoCodec && hasAudio) {
+            return videoCodec + ',mp4a.40.2';
+        }
+        if (videoCodec && d.length > 800) {
             return videoCodec + ',mp4a.40.2';
         }
         return videoCodec;
