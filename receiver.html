@@ -89,7 +89,7 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    report('Receiver v3 started');
+    report('Receiver v4 started');
 
     let ws = null;
     let mediaSource = null, sourceBuffer = null;
@@ -98,6 +98,10 @@
     let hasPlayed = false;
     let statusTimer = null;
 
+    let audioSourceBuffer = null;
+    let audioQueue = [], audioAppending = false, audioInitReceived = false;
+    let lastAudioInitSeg = null;
+
     const LATENCY_CHECK_MS    = 200;
     const MAX_DRIFT_SEC       = 0.25;
     const TRIM_INTERVAL_MS    = 2000;
@@ -105,6 +109,7 @@
     const STALL_TIMEOUT_MS    = 5000;
     const REINIT_COOLDOWN_MS  = 3000;
     const QUEUE_MAX           = 20;
+    const AUDIO_QUEUE_MAX     = 40;
 
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastTrimTime = 0, lastReinitTime = 0;
@@ -133,23 +138,16 @@
         };
 
         ws.onmessage = (evt) => {
-            const data = new Uint8Array(evt.data);
+            const raw = new Uint8Array(evt.data);
+            if (raw.length === 0) return;
 
-            if (!initReceived) {
-                initReceived = true;
-                lastInitSeg = data;
-                report('Init segment: ' + data.length + ' bytes');
-                createMSE(data);
+            if (raw[0] === 0x01) {
+                const audioData = new Uint8Array(evt.data, 1);
+                handleAudioData(audioData);
                 return;
             }
 
-            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-                lastInitSeg = data;
-                report('Re-init (resolution change): ' + data.length + ' bytes');
-                reinitMSE();
-                return;
-            }
-            enqueue(data);
+            handleVideoData(raw);
         };
 
         ws.onerror = () => {
@@ -163,10 +161,108 @@
             setTimeout(() => {
                 if (!ws || ws.readyState === WebSocket.CLOSED) {
                     initReceived = false;
+                    audioInitReceived = false;
                     startStream(url);
                 }
             }, 300);
         };
+    }
+
+    function handleVideoData(data) {
+        if (!initReceived) {
+            initReceived = true;
+            lastInitSeg = data;
+            report('Init segment: ' + data.length + ' bytes');
+            createMSE(data);
+            return;
+        }
+
+        if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+            lastInitSeg = data;
+            report('Re-init (resolution change): ' + data.length + ' bytes');
+            reinitMSE();
+            return;
+        }
+        enqueue(data);
+    }
+
+    function handleAudioData(data) {
+        if (!mediaSource || mediaSource.readyState !== 'open') {
+            return;
+        }
+
+        if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+            lastAudioInitSeg = data;
+            if (!audioInitReceived) {
+                audioInitReceived = true;
+                report('Audio init segment: ' + data.length + ' bytes');
+                createAudioSourceBuffer(data);
+            } else {
+                report('Audio re-init: ' + data.length + ' bytes');
+                recreateAudioSourceBuffer();
+            }
+            return;
+        }
+
+        if (!audioSourceBuffer) return;
+        audioEnqueue(data);
+    }
+
+    function createAudioSourceBuffer(initSeg) {
+        if (!mediaSource || mediaSource.readyState !== 'open') return;
+        try {
+            audioSourceBuffer = mediaSource.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+            audioSourceBuffer.mode = 'sequence';
+            audioSourceBuffer.addEventListener('updateend', onAudioUpdateEnd);
+            audioSourceBuffer.addEventListener('error', () => {
+                report('Audio SourceBuffer error');
+            });
+            audioQueue.unshift(initSeg);
+            drainAudioQueue();
+            report('Audio SourceBuffer created');
+
+            video.muted = false;
+            report('Video unmuted (audio track available)');
+        } catch(e) {
+            report('Audio addSourceBuffer failed: ' + e.message);
+            audioSourceBuffer = null;
+        }
+    }
+
+    function recreateAudioSourceBuffer() {
+        if (lastAudioInitSeg && audioSourceBuffer) {
+            audioQueue = [];
+            audioAppending = false;
+            audioQueue.push(lastAudioInitSeg);
+            drainAudioQueue();
+        }
+    }
+
+    function audioEnqueue(data) {
+        if (audioQueue.length >= AUDIO_QUEUE_MAX) {
+            const drop = audioQueue.length - Math.floor(AUDIO_QUEUE_MAX / 2);
+            audioQueue.splice(0, drop);
+        }
+        audioQueue.push(data);
+        drainAudioQueue();
+    }
+
+    function drainAudioQueue() {
+        if (audioAppending || !audioSourceBuffer || audioQueue.length === 0) return;
+        if (audioSourceBuffer.updating) return;
+        audioAppending = true;
+        const chunk = audioQueue.shift();
+        try {
+            audioSourceBuffer.appendBuffer(chunk);
+        } catch(e) {
+            audioAppending = false;
+            report('Audio appendBuffer error: ' + e.name);
+        }
+    }
+
+    function onAudioUpdateEnd() {
+        audioAppending = false;
+        drainAudioQueue();
     }
 
     function stopStream() {
@@ -179,9 +275,13 @@
         }
         mediaSource = null;
         sourceBuffer = null;
+        audioSourceBuffer = null;
         queue = [];
+        audioQueue = [];
         appending = false;
+        audioAppending = false;
         initReceived = false;
+        audioInitReceived = false;
         hasPlayed = false;
         lastProgressCT = -1;
         lastProgressTime = 0;
@@ -226,6 +326,11 @@
                     statusTimer = null;
                 }
             }, 100);
+
+            if (lastAudioInitSeg) {
+                audioInitReceived = true;
+                createAudioSourceBuffer(lastAudioInitSeg);
+            }
         });
 
         mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
@@ -253,9 +358,13 @@
         }
         mediaSource = null;
         sourceBuffer = null;
+        audioSourceBuffer = null;
         queue = [];
+        audioQueue = [];
         appending = false;
+        audioAppending = false;
         hasPlayed = false;
+        audioInitReceived = false;
         lastProgressCT = -1;
 
         if (lastInitSeg) {
@@ -310,7 +419,8 @@
         video.play().then(() => {
             hasPlayed = true;
             hideStatus();
-            report('PLAYING time=' + video.currentTime.toFixed(3));
+            video.muted = false;
+            report('PLAYING time=' + video.currentTime.toFixed(3) + ' unmuted');
         }).catch(e => {
             if (e && e.name !== 'AbortError') {
                 report('play() error: ' + e.name + ' ' + (e.message || ''));
@@ -363,6 +473,14 @@
                 }
             }
 
+            if (audioSourceBuffer && !audioSourceBuffer.updating && audioSourceBuffer.buffered.length > 0) {
+                const abStart = audioSourceBuffer.buffered.start(0);
+                const aRemoveEnd = ct - TRIM_KEEP_BEHIND;
+                if (aRemoveEnd > abStart + 0.1) {
+                    try { audioSourceBuffer.remove(abStart, aRemoveEnd); } catch(_) {}
+                }
+            }
+
             if (sourceBuffer.buffered.length > 2) {
                 report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
                 reinitMSE();
@@ -377,6 +495,13 @@
             const end = Math.max(start, video.currentTime - 0.5);
             if (end > start) sourceBuffer.remove(start, end);
         } catch(_) {}
+        if (audioSourceBuffer && audioSourceBuffer.buffered.length > 0) {
+            try {
+                const aStart = audioSourceBuffer.buffered.start(0);
+                const aEnd = Math.max(aStart, video.currentTime - 0.5);
+                if (aEnd > aStart) audioSourceBuffer.remove(aStart, aEnd);
+            } catch(_) {}
+        }
     }
 
     video.addEventListener('waiting', () => {
