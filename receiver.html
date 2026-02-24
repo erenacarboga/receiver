@@ -79,7 +79,7 @@
             }
             startStream(d.wsUrl);
         }
-        else if (d.type === 'STOP_STREAM')   { stopStream(); }
+        else if (d.type === 'STOP_STREAM')   { stopStream(); stopWebRTC(); }
         else if (d.type === 'PLAY_HLS')      {
             report('PLAY_HLS: ' + d.hlsUrl + ' sound=' + d.soundEnabled);
             video.muted = (d.soundEnabled === false);
@@ -89,6 +89,15 @@
         else if (d.type === 'SET_SOUND')     {
             report('SET_SOUND: ' + d.enabled);
             video.muted = !d.enabled;
+        }
+        else if (d.type === 'WEBRTC_OFFER')  {
+            report('WEBRTC_OFFER received, sound=' + d.soundEnabled);
+            video.muted = (d.soundEnabled === false);
+            handleWebRTCOffer(d.sdp);
+        }
+        else if (d.type === 'WEBRTC_ICE')    {
+            report('WEBRTC_ICE candidate received');
+            handleRemoteICE(d.sdpMid, d.sdpMLineIndex, d.candidate);
         }
     });
 
@@ -118,14 +127,14 @@
     let statusTimer = null;
 
     const LATENCY_CHECK_MS    = 100;
-    const MAX_DRIFT_SEC       = 0.25;
+    const MAX_DRIFT_SEC       = 0.4;
     const TRIM_INTERVAL_MS    = 1500;
-    const TRIM_KEEP_BEHIND    = 0.6;
-    const STALL_TIMEOUT_MS    = 2200;
+    const TRIM_KEEP_BEHIND    = 1.0;
+    const STALL_TIMEOUT_MS    = 3000;
     const REINIT_COOLDOWN_MS  = 2000;
-    const QUEUE_MAX           = 8;
-    const SEEK_BEHIND         = 0.02;
-    const WAITING_THROTTLE_MS = 150;
+    const QUEUE_MAX           = 15;
+    const SEEK_BEHIND         = 0.05;
+    const WAITING_THROTTLE_MS = 250;
 
     let lastProgressTime = 0, lastProgressCT = -1;
     let lastTrimTime = 0, lastReinitTime = 0;
@@ -167,24 +176,7 @@
 
         ws.onmessage = (evt) => {
             const data = new Uint8Array(evt.data);
-
-            if (!initReceived) {
-                initReceived = true;
-                lastInitSeg = data;
-                report('Init segment: ' + data.length + ' bytes');
-                createMSE(data);
-                return;
-            }
-
-            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-                lastInitSeg = data;
-                report('Re-init (resolution change): ' + data.length + ' bytes');
-                reinitMSE();
-                return;
-            }
-            totalBytesReceived += data.length;
-            fragmentsReceived++;
-            enqueue(data);
+            handleIncomingFragment(data);
         };
 
         ws.onerror = () => {
@@ -202,6 +194,141 @@
                 }
             }, 300);
         };
+    }
+
+    let rtcPC = null;
+    let rtcDC = null;
+
+    function sendSignaling(msg) {
+        if (senderBusId) {
+            try { ctx.sendCustomMessage(NS, senderBusId, msg); } catch(_){}
+        }
+    }
+
+    function handleWebRTCOffer(sdp) {
+        stopStream();
+        stopHLS();
+        stopWebRTC();
+
+        welcomeImg.style.display = 'none';
+        video.style.display = 'block';
+        showStatus('Connecting (WebRTC)…');
+
+        if (typeof RTCPeerConnection === 'undefined') {
+            report('WebRTC NOT supported on this device — cannot proceed');
+            showStatus('WebRTC not supported');
+            sendSignaling({type: 'WEBRTC_UNSUPPORTED'});
+            return;
+        }
+
+        rtcPC = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' });
+
+        rtcPC.onicecandidate = (event) => {
+            if (event.candidate) {
+                report('Sending ICE candidate to phone');
+                sendSignaling({
+                    type: 'WEBRTC_ICE',
+                    sdpMid: event.candidate.sdpMid,
+                    sdpMLineIndex: event.candidate.sdpMLineIndex,
+                    candidate: event.candidate.candidate
+                });
+            }
+        };
+
+        rtcPC.oniceconnectionstatechange = () => {
+            report('ICE state: ' + rtcPC.iceConnectionState);
+            if (rtcPC.iceConnectionState === 'connected' || rtcPC.iceConnectionState === 'completed') {
+                report('WebRTC P2P connected over UDP!');
+            }
+            if (rtcPC.iceConnectionState === 'failed') {
+                report('WebRTC ICE failed');
+                showStatus('Connection failed');
+            }
+        };
+
+        rtcPC.ondatachannel = (event) => {
+            report('DataChannel received: ' + event.channel.label);
+            rtcDC = event.channel;
+            rtcDC.binaryType = 'arraybuffer';
+
+            rtcDC.onopen = () => {
+                report('DataChannel OPEN — receiving fMP4 via UDP');
+                showStatus('Buffering…');
+            };
+
+            rtcDC.onmessage = (evt) => {
+                const data = new Uint8Array(evt.data);
+                handleIncomingFragment(data);
+            };
+
+            rtcDC.onclose = () => {
+                report('DataChannel closed');
+            };
+        };
+
+        const offer = new RTCSessionDescription({ type: 'offer', sdp: sdp });
+        rtcPC.setRemoteDescription(offer).then(() => {
+            report('Remote offer set, creating answer');
+            return rtcPC.createAnswer();
+        }).then((answer) => {
+            return rtcPC.setLocalDescription(answer);
+        }).then(() => {
+            report('Sending SDP answer to phone');
+            sendSignaling({
+                type: 'WEBRTC_ANSWER',
+                sdp: rtcPC.localDescription.sdp
+            });
+        }).catch((err) => {
+            report('WebRTC setup error: ' + err.message);
+            showStatus('WebRTC error');
+        });
+    }
+
+    function handleRemoteICE(sdpMid, sdpMLineIndex, candidate) {
+        if (!rtcPC) return;
+        const ice = new RTCIceCandidate({
+            sdpMid: sdpMid,
+            sdpMLineIndex: sdpMLineIndex,
+            candidate: candidate
+        });
+        rtcPC.addIceCandidate(ice).catch(e => {
+            report('addIceCandidate error: ' + e.message);
+        });
+    }
+
+    function handleIncomingFragment(data) {
+        if (!initReceived) {
+            initReceived = true;
+            lastInitSeg = data;
+            report('Init segment: ' + data.length + ' bytes');
+            createMSE(data);
+            return;
+        }
+
+        if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+            lastInitSeg = data;
+            report('Re-init (resolution change): ' + data.length + ' bytes');
+            reinitMSE();
+            return;
+        }
+
+        totalBytesReceived += data.length;
+        fragmentsReceived++;
+        enqueue(data);
+    }
+
+    function stopWebRTC() {
+        if (rtcDC) { rtcDC.close(); rtcDC = null; }
+        if (rtcPC) { rtcPC.close(); rtcPC = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        initReceived = false;
+        hasPlayed = false;
     }
 
     function stopHLS() {
@@ -335,6 +462,9 @@
 
     function stopStream() {
         stopHLS();
+        if (rtcDC) { rtcDC.close(); rtcDC = null; }
+        if (rtcPC) { rtcPC.close(); rtcPC = null; }
+
         if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
         if (statusTimer)  { clearInterval(statusTimer);  statusTimer = null; }
         if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
