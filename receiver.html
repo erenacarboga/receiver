@@ -3,7 +3,6 @@
 <head>
     <meta charset="utf-8">
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
     <style>
         html, body {
             margin: 0; padding: 0;
@@ -210,11 +209,46 @@
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
     }
 
+    function loadHlsLibrary(hlsUrl) {
+        return new Promise((resolve, reject) => {
+            if (typeof Hls !== 'undefined') { resolve(); return; }
+
+            const baseUrl = new URL(hlsUrl).origin;
+            const localSrc = baseUrl + '/hls.min.js';
+            const cdnSrc  = 'https://cdn.jsdelivr.net/npm/hls.js@1';
+
+            report('Loading hls.js from phone: ' + localSrc);
+            const s1 = document.createElement('script');
+            s1.src = localSrc;
+            s1.onload = () => { report('hls.js loaded from phone server'); resolve(); };
+            s1.onerror = () => {
+                report('Phone hls.js failed, fallback to CDN');
+                const s2 = document.createElement('script');
+                s2.src = cdnSrc;
+                s2.onload = () => { report('hls.js loaded from CDN fallback'); resolve(); };
+                s2.onerror = () => reject(new Error('Could not load hls.js'));
+                document.head.appendChild(s2);
+            };
+            document.head.appendChild(s1);
+        });
+    }
+
     function playHLS(hlsUrl) {
         stopStream();
         stopHLS();
         welcomeImg.style.display = 'none';
         video.style.display = 'block';
+        showStatus('Loading player…');
+
+        loadHlsLibrary(hlsUrl).then(() => {
+            _startHLS(hlsUrl);
+        }).catch(e => {
+            report('FATAL: hls.js unavailable - ' + e.message);
+            showStatus('Player not available');
+        });
+    }
+
+    function _startHLS(hlsUrl) {
         showStatus('Buffering…');
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
