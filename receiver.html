@@ -119,9 +119,8 @@
     }
 
     function startStream(wsUrl) {
-        welcomeImg.style.display = 'none';
         video.style.display = 'block';
-        showStatus('Connecting…');
+        if (welcomeImg.style.display !== 'block') showStatus('Connecting…');
         stopStream();
 
         ws = new WebSocket(wsUrl);
@@ -129,7 +128,7 @@
 
         ws.onopen = () => {
             report('WebSocket connected');
-            showStatus('Buffering…');
+            if (welcomeImg.style.display !== 'block') showStatus('Buffering…');
         };
 
         ws.onmessage = (evt) => {
@@ -309,6 +308,7 @@
 
         video.play().then(() => {
             hasPlayed = true;
+            welcomeImg.style.display = 'none';
             hideStatus();
             report('PLAYING time=' + video.currentTime.toFixed(3));
         }).catch(e => {
