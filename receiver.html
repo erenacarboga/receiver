@@ -291,11 +291,10 @@
 
     function onUpdateEnd() {
         appending = false;
-        drainQueue();
-
         if (!hasPlayed && sourceBuffer && sourceBuffer.buffered.length > 0) {
             attemptPlay();
         }
+        drainQueue();
     }
 
     function attemptPlay() {
@@ -303,9 +302,7 @@
 
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const start = sourceBuffer.buffered.start(0);
-        if (edge - start < 0.06) return;
-
-        video.currentTime = Math.max(0, edge - 0.02);
+        if (edge - start < 0.03) return;
 
         video.play().then(() => {
             hasPlayed = true;
@@ -400,6 +397,20 @@
         const err = video.error;
         report('video error: code=' + (err ? err.code : '?'));
         if (lastInitSeg) reinitMSE();
+    });
+
+    video.addEventListener('canplay', () => {
+        if (!hasPlayed) {
+            video.play().then(() => {
+                hasPlayed = true;
+                hideStatus();
+                report('PLAYING via canplay');
+            }).catch(e => {
+                if (e && e.name !== 'AbortError') {
+                    report('canplay play() error: ' + e.name + ' ' + (e.message || ''));
+                }
+            });
+        }
     });
 
     video.addEventListener('playing', () => hideStatus());
