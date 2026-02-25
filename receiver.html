@@ -414,10 +414,10 @@
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const start = sourceBuffer.buffered.start(0);
-        if (edge - start < 0.05) return;
+        if (edge - start < 0.3) return;
 
         playAttemptPending = true;
-        video.currentTime = Math.max(edge - 0.1, start);
+        video.currentTime = Math.max(edge - 0.25, start);
 
         video.play().then(() => {
             hasPlayed = true;
@@ -460,8 +460,8 @@
         if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
-        if (drift > 0.05) {
-            video.currentTime = edge - 0.05;
+        if (drift > 0.15) {
+            video.currentTime = edge - 0.15;
             seekCount++;
             waitCount++;
             report('waiting → seek edge=' + edge.toFixed(3) + ' drift=' + drift.toFixed(2));
@@ -471,8 +471,8 @@
     video.addEventListener('stalled', () => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.05) {
-            video.currentTime = edge - 0.05;
+        if (edge - video.currentTime > 0.15) {
+            video.currentTime = edge - 0.15;
         }
     });
 
@@ -515,7 +515,7 @@
             const drift = edge - ct;
 
             if (drift > 0.5 && hasPlayed) {
-                video.currentTime = edge - 0.05;
+                video.currentTime = edge - 0.1;
                 seekCount++;
             }
 
