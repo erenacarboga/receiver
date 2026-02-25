@@ -70,46 +70,41 @@
     ctx.addCustomMessageListener(NS, event => {
         senderBusId = event.senderId;
         const d = event.data;
-
-        if (d.type === 'START_STREAM') {
+        if (d.type === 'START_STREAM')       {
             report('START_STREAM: ' + d.wsUrl + ' sound=' + d.soundEnabled);
-            video.muted = (d.soundEnabled === false);
-            try {
-                const wsUrl = new URL(d.wsUrl);
-                const httpUrl = 'http://' + wsUrl.hostname + ':8080/live.mp4';
-                startHTTPStream(httpUrl);
-            } catch(e) {
-                report('URL parse error: ' + e.message);
-                startWSStream(d.wsUrl);
+            if (d.soundEnabled === false) {
+                video.muted = true;
+            } else {
+                video.muted = false;
             }
+            startStream(d.wsUrl);
         }
-        else if (d.type === 'STOP_STREAM')  { stopAll(); }
-        else if (d.type === 'PLAY_HLS') {
+        else if (d.type === 'STOP_STREAM')   { stopStream(); stopWebRTC(); }
+        else if (d.type === 'PLAY_HLS')      {
             report('PLAY_HLS: ' + d.hlsUrl + ' sound=' + d.soundEnabled);
             video.muted = (d.soundEnabled === false);
-            try {
-                const hlsUrlObj = new URL(d.hlsUrl);
-                const httpUrl = 'http://' + hlsUrlObj.hostname + ':8080/live.mp4';
-                startHTTPStream(httpUrl);
-            } catch(e) {
-                report('PLAY_HLS URL parse error: ' + e.message);
-            }
+            playHLS(d.hlsUrl);
         }
-        else if (d.type === 'SHOW_WELCOME') {
-            report('SHOW_WELCOME: ' + d.imageUrl);
-            showWelcome(d.imageUrl);
-        }
-        else if (d.type === 'SET_SOUND') {
+        else if (d.type === 'SHOW_WELCOME')  { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
+        else if (d.type === 'SET_SOUND')     {
             report('SET_SOUND: ' + d.enabled);
             video.muted = !d.enabled;
+        }
+        else if (d.type === 'WEBRTC_OFFER')  {
+            report('WEBRTC_OFFER received, sound=' + d.soundEnabled);
+            video.muted = (d.soundEnabled === false);
+            handleWebRTCOffer(d.sdp);
+        }
+        else if (d.type === 'WEBRTC_ICE')    {
+            report('WEBRTC_ICE candidate received');
+            handleRemoteICE(d.sdpMid, d.sdpMLineIndex, d.candidate);
         }
     });
 
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, req => {
         try {
             const url = new URL(req.media.contentId);
-            const httpUrl = 'http://' + url.hostname + ':8080/live.mp4';
-            startHTTPStream(httpUrl);
+            startStream('ws://' + url.hostname + ':8082/stream');
         } catch(e) { report('LOAD error: ' + e.message); }
         return null;
     });
@@ -120,155 +115,358 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    report('Receiver v4 — HTTP chunked fMP4');
-
-    let diagTimer = null;
-    let streamStartTime = 0;
-    let hasPlayed = false;
-    let retryTimer = null;
-    let retryCount = 0;
-    let currentStreamUrl = null;
-
-    function startHTTPStream(httpUrl) {
-        stopAll();
-        currentStreamUrl = httpUrl;
-        retryCount = 0;
-
-        welcomeImg.style.display = 'none';
-        video.style.display = 'block';
-        showStatus('Connecting…');
-
-        report('HTTP stream: ' + httpUrl);
-
-        video.src = httpUrl;
-        video.load();
-
-        streamStartTime = Date.now();
-        startDiagnostics();
-    }
+    report('Receiver v3 started');
 
     let ws = null;
     let mediaSource = null, sourceBuffer = null;
-    let msQueue = [], msAppending = false, initReceived = false;
+    let hlsInstance = null;
+    let hlsLiveEdgeTimer = null;
+    let queue = [], appending = false, initReceived = false;
     let lastInitSeg = null;
+    let hasPlayed = false;
+    let statusTimer = null;
 
-    function startWSStream(wsUrl) {
-        stopAll();
-        currentStreamUrl = wsUrl;
-        retryCount = 0;
+    const LATENCY_CHECK_MS    = 80;
+    const MAX_DRIFT_SEC       = 0.15;
+    const TRIM_INTERVAL_MS    = 800;
+    const TRIM_KEEP_BEHIND    = 0.3;
+    const STALL_TIMEOUT_MS    = 1500;
+    const REINIT_COOLDOWN_MS  = 2000;
+    const QUEUE_MAX           = 8;
+    const SEEK_BEHIND         = 0.02;
+    const WAITING_THROTTLE_MS = 100;
 
-        welcomeImg.style.display = 'none';
-        video.style.display = 'block';
-        showStatus('Connecting (WS)…');
-
-        report('Fallback WS+MSE: ' + wsUrl);
-
-        ws = new WebSocket(wsUrl);
-        ws.binaryType = 'arraybuffer';
-
-        ws.onopen = () => {
-            report('WS connected');
-            showStatus('Buffering…');
-        };
-
-        ws.onmessage = (evt) => {
-            const data = new Uint8Array(evt.data);
-            if (!initReceived) {
-                initReceived = true;
-                lastInitSeg = data;
-                report('Init segment: ' + data.length + ' bytes');
-                createMSE(data);
-                return;
-            }
-            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-                lastInitSeg = data;
-                report('Re-init: ' + data.length + ' bytes');
-                createMSE(data);
-                return;
-            }
-            enqueueMS(data);
-        };
-
-        ws.onerror = () => { report('WS error'); };
-        ws.onclose = () => {
-            report('WS closed');
-            if (currentStreamUrl === wsUrl) {
-                retryTimer = setTimeout(() => startWSStream(wsUrl), 500);
-            }
-        };
-
-        streamStartTime = Date.now();
-        startDiagnostics();
-    }
-
-    function createMSE(initSeg) {
-        if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(_){}
-        }
-        mediaSource = null;
-        sourceBuffer = null;
-        msQueue = [];
-        msAppending = false;
-
-        mediaSource = new MediaSource();
-        mediaSource.addEventListener('sourceopen', () => {
-            try {
-                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.640029,mp4a.40.2"');
-            } catch(e) {
-                try {
-                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E,mp4a.40.2"');
-                } catch(e2) {
-                    report('addSourceBuffer failed: ' + e2.message);
-                    return;
-                }
-            }
-            sourceBuffer.mode = 'sequence';
-            sourceBuffer.addEventListener('updateend', () => {
-                msAppending = false;
-                drainMS();
-            });
-            msQueue.unshift(initSeg);
-            drainMS();
-        });
-        video.src = URL.createObjectURL(mediaSource);
-    }
-
-    function enqueueMS(data) {
-        if (msQueue.length > 10) msQueue.splice(0, msQueue.length - 5);
-        msQueue.push(data);
-        drainMS();
-    }
-
-    function drainMS() {
-        if (msAppending || !sourceBuffer || msQueue.length === 0) return;
-        if (sourceBuffer.updating) return;
-        if (!mediaSource || mediaSource.readyState !== 'open') return;
-        msAppending = true;
-        try {
-            sourceBuffer.appendBuffer(msQueue.shift());
-        } catch(e) {
-            msAppending = false;
-            report('appendBuffer error: ' + e.name);
-        }
-    }
+    let lastProgressTime = 0, lastProgressCT = -1;
+    let lastTrimTime = 0, lastReinitTime = 0;
+    let latencyTimer = null;
+    let appendErrorCount = 0;
+    let lastWaitingSeek = 0;
+    let playPending = false;
+    let diagTimer = null;
+    let totalBytesReceived = 0;
+    let fragmentsReceived = 0;
+    let streamStartTime = 0;
+    let lastDiagTime = 0;
+    let lastDroppedFrames = 0;
+    let lastTotalFrames = 0;
+    let seekCount = 0;
+    let waitingCount = 0;
 
     function showWelcome(imageUrl) {
-        stopAll();
+        stopStream();
         welcomeImg.src = imageUrl;
         welcomeImg.style.display = 'block';
         video.style.display = 'none';
         hideStatus();
     }
 
-    function stopAll() {
-        currentStreamUrl = null;
-        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-        if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+    function startStream(wsUrl) {
+        welcomeImg.style.display = 'none';
+        video.style.display = 'block';
+        showStatus('Connecting…');
+        stopStream();
 
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
 
+        ws.onopen = () => {
+            report('WebSocket connected');
+            showStatus('Buffering…');
+        };
+
+        ws.onmessage = (evt) => {
+            const data = new Uint8Array(evt.data);
+            handleIncomingFragment(data);
+        };
+
+        ws.onerror = () => {
+            report('WS error');
+            showStatus('Connection error');
+        };
+
+        ws.onclose = () => {
+            report('WS closed');
+            const url = wsUrl;
+            setTimeout(() => {
+                if (!ws || ws.readyState === WebSocket.CLOSED) {
+                    initReceived = false;
+                    startStream(url);
+                }
+            }, 300);
+        };
+    }
+
+    let rtcPC = null;
+    let rtcDC = null;
+
+    function sendSignaling(msg) {
+        if (senderBusId) {
+            try { ctx.sendCustomMessage(NS, senderBusId, msg); } catch(_){}
+        }
+    }
+
+    function handleWebRTCOffer(sdp) {
+        stopStream();
+        stopHLS();
+        stopWebRTC();
+
+        welcomeImg.style.display = 'none';
+        video.style.display = 'block';
+        showStatus('Connecting (WebRTC)…');
+
+        if (typeof RTCPeerConnection === 'undefined') {
+            report('WebRTC NOT supported on this device — cannot proceed');
+            showStatus('WebRTC not supported');
+            sendSignaling({type: 'WEBRTC_UNSUPPORTED'});
+            return;
+        }
+
+        rtcPC = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' });
+
+        rtcPC.onicecandidate = (event) => {
+            if (event.candidate) {
+                report('Sending ICE candidate to phone');
+                sendSignaling({
+                    type: 'WEBRTC_ICE',
+                    sdpMid: event.candidate.sdpMid,
+                    sdpMLineIndex: event.candidate.sdpMLineIndex,
+                    candidate: event.candidate.candidate
+                });
+            }
+        };
+
+        rtcPC.oniceconnectionstatechange = () => {
+            report('ICE state: ' + rtcPC.iceConnectionState);
+            if (rtcPC.iceConnectionState === 'connected' || rtcPC.iceConnectionState === 'completed') {
+                report('WebRTC P2P connected over UDP!');
+            }
+            if (rtcPC.iceConnectionState === 'failed') {
+                report('WebRTC ICE failed');
+                showStatus('Connection failed');
+            }
+        };
+
+        rtcPC.ondatachannel = (event) => {
+            report('DataChannel received: ' + event.channel.label);
+            rtcDC = event.channel;
+            rtcDC.binaryType = 'arraybuffer';
+
+            rtcDC.onopen = () => {
+                report('DataChannel OPEN — receiving fMP4 via UDP');
+                showStatus('Buffering…');
+            };
+
+            rtcDC.onmessage = (evt) => {
+                const data = new Uint8Array(evt.data);
+                handleIncomingFragment(data);
+            };
+
+            rtcDC.onclose = () => {
+                report('DataChannel closed');
+            };
+        };
+
+        const offer = new RTCSessionDescription({ type: 'offer', sdp: sdp });
+        rtcPC.setRemoteDescription(offer).then(() => {
+            report('Remote offer set, creating answer');
+            return rtcPC.createAnswer();
+        }).then((answer) => {
+            return rtcPC.setLocalDescription(answer);
+        }).then(() => {
+            report('Sending SDP answer to phone');
+            sendSignaling({
+                type: 'WEBRTC_ANSWER',
+                sdp: rtcPC.localDescription.sdp
+            });
+        }).catch((err) => {
+            report('WebRTC setup error: ' + err.message);
+            showStatus('WebRTC error');
+        });
+    }
+
+    function handleRemoteICE(sdpMid, sdpMLineIndex, candidate) {
+        if (!rtcPC) return;
+        const ice = new RTCIceCandidate({
+            sdpMid: sdpMid,
+            sdpMLineIndex: sdpMLineIndex,
+            candidate: candidate
+        });
+        rtcPC.addIceCandidate(ice).catch(e => {
+            report('addIceCandidate error: ' + e.message);
+        });
+    }
+
+    function handleIncomingFragment(data) {
+        if (!initReceived) {
+            initReceived = true;
+            lastInitSeg = data;
+            report('Init segment: ' + data.length + ' bytes');
+            createMSE(data);
+            return;
+        }
+
+        if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+            lastInitSeg = data;
+            report('Re-init (resolution change): ' + data.length + ' bytes');
+            reinitMSE();
+            return;
+        }
+
+        totalBytesReceived += data.length;
+        fragmentsReceived++;
+        enqueue(data);
+    }
+
+    function stopWebRTC() {
+        if (rtcDC) { rtcDC.close(); rtcDC = null; }
+        if (rtcPC) { rtcPC.close(); rtcPC = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        initReceived = false;
+        hasPlayed = false;
+    }
+
+    function stopHLS() {
+        if (hlsLiveEdgeTimer) { clearInterval(hlsLiveEdgeTimer); hlsLiveEdgeTimer = null; }
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+    }
+
+    function loadHlsLibrary(hlsUrl) {
+        return new Promise((resolve, reject) => {
+            if (typeof Hls !== 'undefined') { resolve(); return; }
+
+            const baseUrl = new URL(hlsUrl).origin;
+            const localSrc = baseUrl + '/hls.min.js';
+            const cdnSrc  = 'https://cdn.jsdelivr.net/npm/hls.js@1';
+
+            report('Loading hls.js from phone: ' + localSrc);
+            const s1 = document.createElement('script');
+            s1.src = localSrc;
+            s1.onload = () => { report('hls.js loaded from phone server'); resolve(); };
+            s1.onerror = () => {
+                report('Phone hls.js failed, fallback to CDN');
+                const s2 = document.createElement('script');
+                s2.src = cdnSrc;
+                s2.onload = () => { report('hls.js loaded from CDN fallback'); resolve(); };
+                s2.onerror = () => reject(new Error('Could not load hls.js'));
+                document.head.appendChild(s2);
+            };
+            document.head.appendChild(s1);
+        });
+    }
+
+    function playHLS(hlsUrl) {
+        stopStream();
+        stopHLS();
+        welcomeImg.style.display = 'none';
+        video.style.display = 'block';
+        showStatus('Loading player…');
+
+        loadHlsLibrary(hlsUrl).then(() => {
+            _startHLS(hlsUrl);
+        }).catch(e => {
+            report('FATAL: hls.js unavailable - ' + e.message);
+            showStatus('Player not available');
+        });
+    }
+
+    function _startHLS(hlsUrl) {
+        showStatus('Buffering…');
+
+        if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+            hlsInstance = new Hls({
+                liveSyncDurationCount: 1,
+                liveMaxLatencyDurationCount: 3,
+                lowLatencyMode: true,
+                maxBufferLength: 1,
+                maxMaxBufferLength: 3,
+                maxBufferHole: 0.5,
+                backBufferLength: 0,
+                enableWorker: true,
+                startFragPrefetch: true,
+                manifestLoadingTimeOut: 15000,
+                manifestLoadingMaxRetry: 50,
+                manifestLoadingRetryDelay: 500,
+                levelLoadingTimeOut: 15000,
+                levelLoadingMaxRetry: 50,
+                levelLoadingRetryDelay: 500,
+                fragLoadingTimeOut: 15000,
+                fragLoadingMaxRetry: 50,
+                fragLoadingRetryDelay: 300,
+            });
+            hlsInstance.loadSource(hlsUrl);
+            hlsInstance.attachMedia(video);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                report('HLS manifest parsed, starting playback');
+                video.play().then(() => {
+                    hasPlayed = true;
+                    hideStatus();
+                    report('HLS PLAYING');
+                }).catch(e => {
+                    report('HLS play() error: ' + (e ? e.message : 'unknown') + ', trying muted');
+                    video.muted = true;
+                    video.play().then(() => {
+                        hasPlayed = true;
+                        hideStatus();
+                        report('HLS PLAYING (muted fallback)');
+                    }).catch(() => {});
+                });
+            });
+            hlsInstance.on(Hls.Events.ERROR, (e, data) => {
+                report('HLS error: ' + data.type + '/' + data.details + ' fatal=' + data.fatal);
+                if (data.fatal) {
+                    switch (data.type) {
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            report('HLS fatal network error, retrying...');
+                            hlsInstance.startLoad();
+                            break;
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            report('HLS fatal media error, recovering...');
+                            hlsInstance.recoverMediaError();
+                            break;
+                        default:
+                            report('HLS unrecoverable error, restarting...');
+                            stopHLS();
+                            setTimeout(() => playHLS(hlsUrl), 2000);
+                            break;
+                    }
+                }
+            });
+            hlsLiveEdgeTimer = setInterval(() => {
+                if (hlsInstance && hlsInstance.liveSyncPosition != null && video.readyState >= 2) {
+                    const behind = hlsInstance.liveSyncPosition - video.currentTime;
+                    if (behind > 2.0) {
+                        video.currentTime = hlsInstance.liveSyncPosition;
+                        report('HLS snap to live edge, was ' + behind.toFixed(1) + 's behind');
+                    }
+                }
+            }, 2000);
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = hlsUrl;
+            video.addEventListener('loadedmetadata', () => {
+                video.play().catch(() => {});
+                hasPlayed = true;
+                hideStatus();
+                report('HLS PLAYING (native)');
+            });
+        } else {
+            showStatus('HLS not supported');
+            report('HLS NOT SUPPORTED on this device');
+        }
+    }
+
+    function stopStream() {
+        stopHLS();
+        if (rtcDC) { rtcDC.close(); rtcDC = null; }
+        if (rtcPC) { rtcPC.close(); rtcPC = null; }
+
+        if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
+        if (statusTimer)  { clearInterval(statusTimer);  statusTimer = null; }
         if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
 
         if (mediaSource && mediaSource.readyState === 'open') {
@@ -276,93 +474,367 @@
         }
         mediaSource = null;
         sourceBuffer = null;
-        msQueue = [];
-        msAppending = false;
+        queue = [];
+        appending = false;
         initReceived = false;
-        lastInitSeg = null;
         hasPlayed = false;
+        lastProgressCT = -1;
+        lastProgressTime = 0;
+        appendErrorCount = 0;
+        playPending = false;
+        if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+        totalBytesReceived = 0;
+        fragmentsReceived = 0;
+        seekCount = 0;
+        waitingCount = 0;
+        lastDroppedFrames = 0;
+        lastTotalFrames = 0;
     }
 
-    video.addEventListener('loadedmetadata', () => {
-        report('loadedmetadata: dur=' + video.duration + ' rs=' + video.readyState);
-    });
+    function createMSE(initSeg) {
+        mediaSource = new MediaSource();
+        appendErrorCount = 0;
 
-    video.addEventListener('canplay', () => {
-        report('canplay: rs=' + video.readyState + ' muted=' + video.muted);
-        if (!hasPlayed) {
-            video.play().then(() => {
-                hasPlayed = true;
-                hideStatus();
-                report('PLAYING');
-            }).catch(e => {
-                report('play() err: ' + (e ? e.name : '?') + ' — trying muted');
+        mediaSource.addEventListener('sourceopen', () => {
+            report('MSE sourceopen');
+            const codec = detectCodec(initSeg) || 'avc1.640029,mp4a.40.2';
+            report('Codec: ' + codec);
+
+            try {
+                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+            } catch(e) {
+                report('addSourceBuffer failed: ' + e.message + ' — trying baseline muxed');
+                try {
+                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E,mp4a.40.2"');
+                } catch(e2) {
+                    report('Baseline muxed also failed: ' + e2.message + ' — trying video-only');
+                    try {
+                        sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                    } catch(e3) {
+                        report('All codec attempts failed');
+                        return;
+                    }
+                }
+            }
+
+            sourceBuffer.mode = 'sequence';
+            sourceBuffer.addEventListener('updateend', onUpdateEnd);
+            sourceBuffer.addEventListener('error', () => {
+                report('SourceBuffer error');
+                queue = [];
+                appending = false;
+                reinitMSE();
+            });
+
+            queue.unshift(initSeg);
+            drainQueue();
+
+            startLatencyController();
+            startDiagnostics();
+
+            statusTimer = setInterval(() => {
+                attemptPlay();
+                if (hasPlayed && statusTimer) {
+                    clearInterval(statusTimer);
+                    statusTimer = null;
+                }
+            }, 100);
+        });
+
+        mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
+        mediaSource.addEventListener('sourceclose', () => report('MSE sourceclose'));
+
+        video.src = URL.createObjectURL(mediaSource);
+        report('video.src set, waiting for sourceopen…');
+    }
+
+    function reinitMSE() {
+        const now = Date.now();
+        if (now - lastReinitTime < REINIT_COOLDOWN_MS) return;
+        lastReinitTime = now;
+
+        report('reinitMSE');
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send('FORCE_KEYFRAME');
+        }
+
+        if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null; }
+        if (statusTimer)  { clearInterval(statusTimer);  statusTimer = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        hasPlayed = false;
+        lastProgressCT = -1;
+
+        if (lastInitSeg) {
+            createMSE(lastInitSeg);
+        }
+    }
+
+    function enqueue(data) {
+        if (queue.length >= QUEUE_MAX) {
+            const drop = queue.length - Math.floor(QUEUE_MAX / 2);
+            queue.splice(0, drop);
+            report('Dropped ' + drop + ' queued fragments');
+        }
+        queue.push(data);
+        drainQueue();
+    }
+
+    function drainQueue() {
+        if (appending || !sourceBuffer || queue.length === 0) return;
+        if (sourceBuffer.updating) return;
+        if (!mediaSource || mediaSource.readyState !== 'open') {
+            queue = [];
+            return;
+        }
+        appending = true;
+        const chunk = queue.shift();
+        try {
+            sourceBuffer.appendBuffer(chunk);
+            appendErrorCount = 0;
+        } catch(e) {
+            appending = false;
+            if (appendErrorCount < 5) {
+                report('appendBuffer error: ' + e.name);
+            } else if (appendErrorCount === 5) {
+                report('appendBuffer errors suppressed (' + appendErrorCount + '+)');
+            }
+            appendErrorCount++;
+            if (e.name === 'QuotaExceededError') {
+                emergencyTrim();
+            } else if (e.name === 'InvalidStateError') {
+                queue = [];
+            }
+        }
+    }
+
+    function onUpdateEnd() {
+        appending = false;
+        if (!hasPlayed && sourceBuffer && sourceBuffer.buffered.length > 0) {
+            attemptPlay();
+        }
+        drainQueue();
+    }
+
+    function attemptPlay() {
+        if (hasPlayed || playPending || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const start = sourceBuffer.buffered.start(0);
+        if (edge - start < 0.03) return;
+
+        playPending = true;
+        report('attemptPlay: buf=' + start.toFixed(3) + '-' + edge.toFixed(3)
+            + ' muted=' + video.muted + ' rs=' + video.readyState);
+
+        video.play().then(() => {
+            playPending = false;
+            hasPlayed = true;
+            hideStatus();
+            report('PLAYING time=' + video.currentTime.toFixed(3));
+        }).catch(e => {
+            playPending = false;
+            report('play() error: ' + (e ? e.name + ' ' + (e.message || '') : 'unknown'));
+            if (!video.muted) {
+                playPending = true;
                 video.muted = true;
                 video.play().then(() => {
+                    playPending = false;
                     hasPlayed = true;
                     hideStatus();
-                    report('PLAYING (muted)');
-                }).catch(() => {});
-            });
+                    video.muted = false;
+                    report('PLAYING (muted-workaround) time=' + video.currentTime.toFixed(3));
+                }).catch(() => { playPending = false; });
+            }
+        });
+    }
+
+    function startLatencyController() {
+        lastProgressTime = Date.now();
+        lastProgressCT = -1;
+
+        latencyTimer = setInterval(() => {
+            if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+            if (video.paused && hasPlayed) {
+                video.play().catch(() => {});
+            }
+            if (video.paused) return;
+
+            const now = Date.now();
+            const ct  = video.currentTime;
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+
+            const drift = edge - ct;
+            if (drift > MAX_DRIFT_SEC) {
+                video.currentTime = edge - SEEK_BEHIND;
+                video.playbackRate = 1.0;
+            } else if (drift > 0.08) {
+                video.playbackRate = 1.05;
+            } else {
+                video.playbackRate = 1.0;
+            }
+
+            if (Math.abs(ct - lastProgressCT) > 0.005) {
+                lastProgressTime = now;
+                lastProgressCT = ct;
+            } else {
+                const stuckFor = now - lastProgressTime;
+                const hasDataAhead = (edge - ct) > 0.1;
+                if (stuckFor > STALL_TIMEOUT_MS && hasDataAhead) {
+                    report('Stall: ' + ct.toFixed(2) + 's for ' + (stuckFor/1000).toFixed(1) + 's — reinit');
+                    lastProgressCT = -1;
+                    reinitMSE();
+                    return;
+                }
+            }
+
+            if (now - lastTrimTime > TRIM_INTERVAL_MS && !sourceBuffer.updating) {
+                const removeEnd = ct - TRIM_KEEP_BEHIND;
+                const bufStart = sourceBuffer.buffered.start(0);
+                if (removeEnd > bufStart + 0.1) {
+                    try {
+                        sourceBuffer.remove(bufStart, removeEnd);
+                        lastTrimTime = now;
+                    } catch(_) {}
+                }
+            }
+
+            if (sourceBuffer.buffered.length > 4) {
+                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+                reinitMSE();
+            }
+        }, LATENCY_CHECK_MS);
+    }
+
+    function emergencyTrim() {
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        try {
+            const start = sourceBuffer.buffered.start(0);
+            const end = Math.max(start, video.currentTime - 0.5);
+            if (end > start) sourceBuffer.remove(start, end);
+        } catch(_) {}
+    }
+
+    video.addEventListener('waiting', () => {
+        if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const now = Date.now();
+        if (now - lastWaitingSeek < WAITING_THROTTLE_MS) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 0.03) {
+            video.currentTime = edge - SEEK_BEHIND;
+            lastWaitingSeek = now;
+            seekCount++;
+            waitingCount++;
+            report('waiting → seek to edge ' + edge.toFixed(3));
         }
     });
 
-    video.addEventListener('playing', () => {
-        hideStatus();
-        hasPlayed = true;
-    });
-
-    video.addEventListener('waiting', () => {
-        report('waiting: ct=' + video.currentTime.toFixed(2) + ' rs=' + video.readyState);
-    });
-
     video.addEventListener('stalled', () => {
-        report('stalled: ct=' + video.currentTime.toFixed(2));
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const now = Date.now();
+        if (now - lastWaitingSeek < WAITING_THROTTLE_MS) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 0.03) {
+            video.currentTime = edge - SEEK_BEHIND;
+            lastWaitingSeek = now;
+        }
     });
 
     video.addEventListener('error', () => {
         const err = video.error;
-        report('video error: code=' + (err ? err.code + ' ' + (err.message || '') : '?'));
-        if (currentStreamUrl && retryCount < 10) {
-            const url = currentStreamUrl;
-            const delay = Math.min(500 * (retryCount + 1), 3000);
-            retryCount++;
-            report('Retry #' + retryCount + ' in ' + delay + 'ms');
-            retryTimer = setTimeout(() => {
-                if (url.startsWith('http')) {
-                    startHTTPStream(url);
-                } else {
-                    startWSStream(url);
-                }
-            }, delay);
+        report('video error: code=' + (err ? err.code : '?'));
+        if (lastInitSeg) reinitMSE();
+    });
+
+    video.addEventListener('canplay', () => {
+        report('canplay event: hasPlayed=' + hasPlayed + ' rs=' + video.readyState + ' muted=' + video.muted);
+        if (!hasPlayed) {
+            video.play().then(() => {
+                hasPlayed = true;
+                hideStatus();
+                report('PLAYING via canplay');
+            }).catch(e => {
+                report('canplay play() error: ' + (e ? e.name + ' ' + (e.message || '') : 'unknown'));
+            });
         }
     });
 
+    video.addEventListener('playing', () => hideStatus());
+    video.addEventListener('timeupdate', () => { if (hasPlayed) hideStatus(); });
+
     function startDiagnostics() {
         if (diagTimer) clearInterval(diagTimer);
+        streamStartTime = Date.now();
+        lastDiagTime = streamStartTime;
         diagTimer = setInterval(() => {
-            const elapsed = ((Date.now() - streamStartTime) / 1000).toFixed(1);
+            if (!sourceBuffer) return;
+            const now = Date.now();
+            const elapsed = ((now - streamStartTime) / 1000).toFixed(1);
             const ct = video.currentTime.toFixed(2);
             const paused = video.paused ? 'PAUSED' : 'playing';
             const muted = video.muted ? 'muted' : 'unmuted';
             const rs = video.readyState;
-            const nw = video.networkState;
 
             let bufInfo = 'none';
-            if (video.buffered.length > 0) {
-                const bs = video.buffered.start(0).toFixed(2);
-                const be = video.buffered.end(video.buffered.length - 1).toFixed(2);
-                bufInfo = bs + '-' + be;
+            if (sourceBuffer.buffered.length > 0) {
+                const bs = sourceBuffer.buffered.start(0).toFixed(2);
+                const be = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1).toFixed(2);
+                bufInfo = bs + '-' + be + ' (' + sourceBuffer.buffered.length + ' ranges)';
             }
 
-            let dropInfo = '';
+            let dropInfo = 'N/A';
             if (video.getVideoPlaybackQuality) {
                 const q = video.getVideoPlaybackQuality();
-                dropInfo = ' drop=' + q.droppedVideoFrames + '/' + q.totalVideoFrames;
+                const newDropped = q.droppedVideoFrames - lastDroppedFrames;
+                const newTotal = q.totalVideoFrames - lastTotalFrames;
+                const dropRate = newTotal > 0 ? ((newDropped / newTotal) * 100).toFixed(1) : '0.0';
+                dropInfo = 'dropped=' + q.droppedVideoFrames + '/' + q.totalVideoFrames
+                    + ' (period: ' + newDropped + '/' + newTotal + ' = ' + dropRate + '%)';
+                lastDroppedFrames = q.droppedVideoFrames;
+                lastTotalFrames = q.totalVideoFrames;
             }
 
+            const kbps = ((totalBytesReceived * 8) / ((now - streamStartTime) / 1000) / 1000).toFixed(0);
+
             report('DIAG t=' + elapsed + 's ct=' + ct + ' ' + paused + ' ' + muted
-                + ' rs=' + rs + ' nw=' + nw + ' buf=[' + bufInfo + ']' + dropInfo);
+                + ' rs=' + rs + ' buf=[' + bufInfo + '] q=' + queue.length
+                + ' frags=' + fragmentsReceived + ' ' + kbps + 'kbps'
+                + ' seeks=' + seekCount + ' waits=' + waitingCount
+                + ' | ' + dropInfo);
         }, 5000);
+    }
+
+    function detectCodec(d) {
+        let videoCodec = null;
+        let hasAudio = false;
+        for (let i = 0; i < d.length - 4; i++) {
+            if (!videoCodec && i + 7 < d.length &&
+                d[i]===0x61 && d[i+1]===0x76 && d[i+2]===0x63 && d[i+3]===0x43) {
+                if (d[i+4] === 1) {
+                    const h = n => n.toString(16).padStart(2, '0');
+                    videoCodec = 'avc1.' + h(d[i+5]) + h(d[i+6]) + h(d[i+7]);
+                }
+            }
+            if (d[i]===0x6D && d[i+1]===0x70 && d[i+2]===0x34 && d[i+3]===0x61) {
+                hasAudio = true;
+            }
+            if (d[i]===0x65 && d[i+1]===0x73 && d[i+2]===0x64 && d[i+3]===0x73) {
+                hasAudio = true;
+            }
+        }
+        if (videoCodec && hasAudio) {
+            return videoCodec + ',mp4a.40.2';
+        }
+        if (videoCodec && d.length > 800) {
+            return videoCodec + ',mp4a.40.2';
+        }
+        return videoCodec;
     }
     </script>
 </body>
