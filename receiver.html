@@ -364,16 +364,22 @@
             try { mediaSource.endOfStream(); } catch(_){}
         }
         revokeURL();
+        // Fully reset video element to clear stale decoder pipeline
+        video.removeAttribute('src');
+        video.load();
         mediaSource = null;
         sourceBuffer = null;
         queue = [];
         appending = false;
         hasPlayed = false;
         playAttemptPending = false;
+        errorReinitCount = 0;
         if (lastInitSeg) createMSE(lastInitSeg);
     }
 
     function enqueue(data) {
+        // Drop fragments while MSE is initializing or in bad state
+        if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return;
         if (queue.length >= 12) {
             const drop = queue.length - 4;
             queue.splice(0, drop);
@@ -397,6 +403,8 @@
             report('appendBuffer error: ' + e.name);
             if (e.name === 'QuotaExceededError') {
                 trimBuffer();
+            } else if (e.name === 'InvalidStateError') {
+                queue = [];  // MSE in bad state — stop trying, wait for reinit
             }
         }
     }
@@ -414,10 +422,10 @@
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const start = sourceBuffer.buffered.start(0);
-        if (edge - start < 0.3) return;
+        if (edge - start < 0.4) return;
 
         playAttemptPending = true;
-        video.currentTime = Math.max(edge - 0.25, start);
+        video.currentTime = Math.max(edge - 0.35, start);
 
         video.play().then(() => {
             hasPlayed = true;
@@ -460,19 +468,27 @@
         if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const drift = edge - video.currentTime;
-        if (drift > 0.15) {
-            video.currentTime = edge - 0.15;
+        if (drift > 0.3) {
+            // Buffer exists ahead — seek to safe margin
+            video.currentTime = edge - 0.25;
             seekCount++;
             waitCount++;
             report('waiting → seek edge=' + edge.toFixed(3) + ' drift=' + drift.toFixed(2));
+        } else {
+            // Buffer too thin — slow down and let it grow
+            video.playbackRate = 0.90;
+            waitCount++;
         }
     });
 
     video.addEventListener('stalled', () => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.15) {
-            video.currentTime = edge - 0.15;
+        const drift = edge - video.currentTime;
+        if (drift > 0.3) {
+            video.currentTime = edge - 0.25;
+        } else if (drift > 0) {
+            video.playbackRate = 0.90;
         }
     });
 
@@ -514,14 +530,38 @@
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             const drift = edge - ct;
 
-            if (drift > 0.5 && hasPlayed) {
-                video.currentTime = edge - 0.1;
+            // ── Playback rate compensation ──
+            // Keep buffer margin at ~0.3-0.5s ahead of playhead.
+            // Instead of hard-seeking (visible stutter), gently adjust
+            // playback speed to let buffer grow or shrink naturally.
+            if (hasPlayed && !video.paused) {
+                if (drift < 0.15) {
+                    // Dangerously thin — slow down to let buffer grow
+                    video.playbackRate = 0.92;
+                } else if (drift < 0.3) {
+                    // Thin buffer — ease off slightly
+                    video.playbackRate = 0.97;
+                } else if (drift > 1.0) {
+                    // Too far behind live edge — catch up
+                    video.playbackRate = 1.06;
+                } else if (drift > 0.6) {
+                    // Slightly behind — gentle catch-up
+                    video.playbackRate = 1.02;
+                } else {
+                    // Sweet spot (0.3–0.6s) — normal speed
+                    video.playbackRate = 1.0;
+                }
+            }
+
+            // Hard seek only when severely behind (>1.5s)
+            if (drift > 1.5 && hasPlayed) {
+                video.currentTime = edge - 0.35;
                 seekCount++;
             }
 
             if (!sourceBuffer.updating && hasPlayed) {
                 const bufStart = sourceBuffer.buffered.start(0);
-                const removeEnd = ct - 2.0;
+                const removeEnd = ct - 3.0;
                 if (removeEnd > bufStart + 0.5) {
                     try { sourceBuffer.remove(bufStart, removeEnd); } catch(_) {}
                 }
