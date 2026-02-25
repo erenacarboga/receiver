@@ -113,8 +113,6 @@
     let errorReinitCount = 0;
     let lastObjectURL = null;
     let playAttemptPending = false;
-    let lastSeekTime = 0;
-    let playRetryCount = 0;
 
     // ═══════════════════════════════════════════════════════════════
     // Welcome Image
@@ -422,38 +420,19 @@
     function attemptPlay() {
         if (hasPlayed || playAttemptPending) return;
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-
-        // Find the last buffered range with at least 0.3s of data
-        const nRanges = sourceBuffer.buffered.length;
-        let targetStart = -1;
-        for (let i = nRanges - 1; i >= 0; i--) {
-            const rs = sourceBuffer.buffered.start(i);
-            const re = sourceBuffer.buffered.end(i);
-            if (re - rs >= 0.3) { targetStart = rs; break; }
-        }
-        if (targetStart < 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const start = sourceBuffer.buffered.start(0);
+        if (edge - start < 0.3) return;
 
         playAttemptPending = true;
-        playRetryCount++;
-        video.currentTime = targetStart + 0.05;
-        report('attemptPlay #' + playRetryCount + ' ct→' + video.currentTime.toFixed(2));
-
-        // Timeout: if play doesn't succeed in 2s, allow retry
-        const playTimeout = setTimeout(() => {
-            if (!hasPlayed) {
-                playAttemptPending = false;
-                report('play() timeout — will retry');
-            }
-        }, 2000);
+        video.currentTime = Math.max(edge - 0.25, start);
 
         video.play().then(() => {
-            clearTimeout(playTimeout);
             hasPlayed = true;
             playAttemptPending = false;
             hideStatus();
             report('PLAYING ct=' + video.currentTime.toFixed(3));
         }).catch(e => {
-            clearTimeout(playTimeout);
             report('play() error: ' + (e ? e.name : '?'));
             if (!video.muted) {
                 video.muted = true;
@@ -487,65 +466,22 @@
 
     video.addEventListener('waiting', () => {
         if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        waitCount++;
-        const now = Date.now();
-        const ct = video.currentTime;
-        const nRanges = sourceBuffer.buffered.length;
-
-        // Check if playhead is inside any buffered range
-        let inRange = false;
-        for (let i = 0; i < nRanges; i++) {
-            if (ct >= sourceBuffer.buffered.start(i) - 0.05 && ct <= sourceBuffer.buffered.end(i)) {
-                inRange = true;
-                break;
-            }
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const drift = edge - video.currentTime;
+        if (drift > 0.15) {
+            video.currentTime = edge - 0.15;
+            seekCount++;
+            waitCount++;
+            report('waiting → seek edge=' + edge.toFixed(3) + ' drift=' + drift.toFixed(2));
         }
-
-        if (!inRange && now - lastSeekTime >= 500) {
-            // Playhead is in a gap — jump to the next available range
-            for (let i = 0; i < nRanges; i++) {
-                if (sourceBuffer.buffered.start(i) > ct) {
-                    video.currentTime = sourceBuffer.buffered.start(i) + 0.05;
-                    lastSeekTime = now;
-                    seekCount++;
-                    report('waiting → gap-skip ' + ct.toFixed(2) + '→' + sourceBuffer.buffered.start(i).toFixed(2));
-                    return;
-                }
-            }
-        }
-
-        // Within a range — decoder needs time. Do NOT seek (causes cascade).
-        // Slow playback rate to let buffer grow.
-        video.playbackRate = 0.85;
     });
 
     video.addEventListener('stalled', () => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const ct = video.currentTime;
-        const nRanges = sourceBuffer.buffered.length;
-        const now = Date.now();
-
-        let inRange = false;
-        for (let i = 0; i < nRanges; i++) {
-            if (ct >= sourceBuffer.buffered.start(i) - 0.05 && ct <= sourceBuffer.buffered.end(i)) {
-                inRange = true;
-                break;
-            }
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 0.15) {
+            video.currentTime = edge - 0.15;
         }
-
-        if (!inRange && now - lastSeekTime >= 500) {
-            for (let i = 0; i < nRanges; i++) {
-                if (sourceBuffer.buffered.start(i) > ct) {
-                    video.currentTime = sourceBuffer.buffered.start(i) + 0.05;
-                    lastSeekTime = now;
-                    seekCount++;
-                    report('stalled → gap-skip to ' + sourceBuffer.buffered.start(i).toFixed(2));
-                    return;
-                }
-            }
-        }
-
-        video.playbackRate = 0.85;
     });
 
     video.addEventListener('canplay', () => {
@@ -580,80 +516,27 @@
         if (liveTimer) clearInterval(liveTimer);
         liveTimer = setInterval(() => {
             if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-
-            // Play recovery: if video hasn't started after 3s, force retry
-            if (!hasPlayed && sourceBuffer.buffered.length > 0 && streamStartTime > 0 && Date.now() - streamStartTime > 3000) {
-                if (!playAttemptPending && playRetryCount < 15) {
-                    report('Play recovery #' + (playRetryCount + 1));
-                    attemptPlay();
-                }
-            }
-
             if (video.paused && hasPlayed) video.play().catch(() => {});
 
             const ct = video.currentTime;
             const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
             const drift = edge - ct;
 
-            // ── Playback rate compensation ──
-            // Keep buffer margin at ~0.3-0.5s ahead of playhead.
-            // Instead of hard-seeking (visible stutter), gently adjust
-            // playback speed to let buffer grow or shrink naturally.
-            if (hasPlayed && !video.paused) {
-                if (drift < 0.15) {
-                    // Dangerously thin — slow down to let buffer grow
-                    video.playbackRate = 0.92;
-                } else if (drift < 0.3) {
-                    // Thin buffer — ease off slightly
-                    video.playbackRate = 0.97;
-                } else if (drift > 1.0) {
-                    // Too far behind live edge — catch up
-                    video.playbackRate = 1.06;
-                } else if (drift > 0.6) {
-                    // Slightly behind — gentle catch-up
-                    video.playbackRate = 1.02;
-                } else {
-                    // Sweet spot (0.3–0.6s) — normal speed
-                    video.playbackRate = 1.0;
-                }
-            }
-
-            // Hard seek only when severely behind (>1.5s)
-            if (drift > 1.5 && hasPlayed) {
-                video.currentTime = edge - 0.35;
+            if (drift > 0.5 && hasPlayed) {
+                video.currentTime = edge - 0.1;
                 seekCount++;
             }
 
             if (!sourceBuffer.updating && hasPlayed) {
                 const bufStart = sourceBuffer.buffered.start(0);
-                const removeEnd = ct - 3.0;
+                const removeEnd = ct - 2.0;
                 if (removeEnd > bufStart + 0.5) {
                     try { sourceBuffer.remove(bufStart, removeEnd); } catch(_) {}
                 }
             }
 
-            // Proactive gap-skip: if buffer has 2+ ranges and playhead is
-            // approaching a gap, jump past it BEFORE waiting event fires.
-            const nRanges = sourceBuffer.buffered.length;
-            if (hasPlayed && nRanges >= 2 && Date.now() - lastSeekTime >= 500) {
-                // Find the gap the playhead is about to hit
-                for (let i = 0; i < nRanges - 1; i++) {
-                    const rangeEnd = sourceBuffer.buffered.end(i);
-                    const nextStart = sourceBuffer.buffered.start(i + 1);
-                    // If playhead is within 0.15s of the gap boundary, skip it
-                    if (ct >= rangeEnd - 0.15 && ct < nextStart) {
-                        video.currentTime = nextStart + 0.05;
-                        lastSeekTime = Date.now();
-                        seekCount++;
-                        report('liveLoop → gap-skip ' + rangeEnd.toFixed(2) + '→' + nextStart.toFixed(2));
-                        break;
-                    }
-                }
-            }
-
-            // If buffer is severely fragmented (4+ ranges), full reinit
-            if (hasPlayed && nRanges >= 4) {
-                report('Fragmented buffer (' + nRanges + ' ranges) — reinit');
+            if (hasPlayed && sourceBuffer.buffered.length > 3) {
+                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
                 reinitMSE();
             }
 
