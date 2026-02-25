@@ -60,25 +60,15 @@
     function showStatus(text) { statusEl.textContent = text; statusEl.style.display = 'block'; }
     function hideStatus() { statusEl.style.display = 'none'; }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Cast Message Handling
+    // ═══════════════════════════════════════════════════════════════
+
     ctx.addCustomMessageListener(NS, event => {
         senderBusId = event.senderId;
         const d = event.data;
-        if (d.type === 'START_STREAM') {
-            report('START_STREAM: ' + d.wsUrl + ' sound=' + d.soundEnabled);
-            video.muted = (d.soundEnabled === false);
-            startStream(d.wsUrl);
-        }
-        else if (d.type === 'STOP_STREAM')  { stopStream(); }
-        else if (d.type === 'PLAY_HLS') {
-            report('PLAY_HLS: ' + d.hlsUrl + ' sound=' + d.soundEnabled);
-            video.muted = (d.soundEnabled === false);
-            try {
-                const u = new URL(d.hlsUrl);
-                startStream('ws://' + u.hostname + ':8082/stream');
-            } catch(e) { report('PLAY_HLS error: ' + e.message); }
-        }
-        else if (d.type === 'WEBRTC_OFFER') {
-            report('WEBRTC_OFFER received — starting WebRTC DataChannel');
+        if (d.type === 'WEBRTC_OFFER') {
+            report('WEBRTC_OFFER received');
             video.muted = (d.soundEnabled === false);
             startWebRTC(d.sdp);
         }
@@ -88,15 +78,12 @@
                   .catch(e => report('addIceCandidate error: ' + e.message));
             }
         }
+        else if (d.type === 'STOP_STREAM')  { stopStream(); }
         else if (d.type === 'SHOW_WELCOME') { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
         else if (d.type === 'SET_SOUND')    { report('SET_SOUND: ' + d.enabled); video.muted = !d.enabled; }
     });
 
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, req => {
-        try {
-            const url = new URL(req.media.contentId);
-            startStream('ws://' + url.hostname + ':8082/stream');
-        } catch(e) { report('LOAD error: ' + e.message); }
         return null;
     });
 
@@ -106,9 +93,14 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    report('Receiver v6 — WS+MSE / WebRTC DataChannel (UDP)');
+    report('Receiver v7 — WebRTC DataChannel (UDP/SCTP/DTLS)');
 
-    let ws = null;
+    // ═══════════════════════════════════════════════════════════════
+    // State
+    // ═══════════════════════════════════════════════════════════════
+
+    let pc = null;           // RTCPeerConnection
+    let dc = null;           // RTCDataChannel
     let mediaSource = null, sourceBuffer = null;
     let queue = [], appending = false, initReceived = false;
     let lastInitSeg = null;
@@ -118,15 +110,13 @@
     let totalBytes = 0, fragments = 0;
     let seekCount = 0, waitCount = 0;
     let lastDropped = 0, lastTotal = 0;
-    let reconnectCount = 0;
-    const MAX_RECONNECTS = 15;
     let errorReinitCount = 0;
     let lastObjectURL = null;
-    let currentWsUrl = null;
+    let playAttemptPending = false;
 
-    let pc = null;
-    let dc = null;
-    let webrtcActive = false;
+    // ═══════════════════════════════════════════════════════════════
+    // Welcome Image
+    // ═══════════════════════════════════════════════════════════════
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -136,88 +126,21 @@
         hideStatus();
     }
 
-    function startStream(wsUrl) {
+    // ═══════════════════════════════════════════════════════════════
+    // WebRTC DataChannel Transport (UDP/SCTP/DTLS)
+    // ═══════════════════════════════════════════════════════════════
+
+    function startWebRTC(offerSDP) {
         welcomeImg.style.display = 'none';
         video.style.display = 'block';
         showStatus('Connecting…');
         stopStream();
 
-        currentWsUrl = wsUrl;
-        reconnectCount = 0;
-        errorReinitCount = 0;
-        report('Connecting WS: ' + wsUrl);
-
-        ws = new WebSocket(wsUrl);
-        ws.binaryType = 'arraybuffer';
-
-        ws.onopen = () => {
-            report('WS connected');
-            showStatus('Buffering…');
-        };
-
-        ws.onmessage = (evt) => {
-            const data = new Uint8Array(evt.data);
-            totalBytes += data.length;
-            fragments++;
-
-            if (!initReceived) {
-                initReceived = true;
-                lastInitSeg = data;
-                report('Init segment: ' + data.length + ' bytes');
-                createMSE(data);
-                return;
-            }
-
-            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-                lastInitSeg = data;
-                report('Re-init (resolution change): ' + data.length + ' bytes');
-                reinitMSE();
-                return;
-            }
-
-            enqueue(data);
-        };
-
-        ws.onerror = () => {
-            report('WS error');
-            showStatus('Connection error');
-        };
-
-        ws.onclose = () => {
-            report('WS closed (reconnect ' + reconnectCount + '/' + MAX_RECONNECTS + ')');
-            if (reconnectCount >= MAX_RECONNECTS) {
-                showStatus('Connection lost');
-                report('Max reconnects reached — giving up');
-                return;
-            }
-            reconnectCount++;
-            const delay = Math.min(500 * reconnectCount, 3000);
-            const url = wsUrl;
-            setTimeout(() => {
-                if (!ws || ws.readyState === WebSocket.CLOSED) {
-                    initReceived = false;
-                    reconnectInternal(url);
-                }
-            }, delay);
-        };
-
-        streamStartTime = Date.now();
-        startDiag();
-        startLiveLoop();
-    }
-
-    function startWebRTC(offerSDP) {
-        welcomeImg.style.display = 'none';
-        video.style.display = 'block';
-        showStatus('WebRTC connecting…');
-        stopStream();
-
-        webrtcActive = true;
-        reconnectCount = 0;
         errorReinitCount = 0;
         streamStartTime = Date.now();
         report('Starting WebRTC peer connection');
 
+        // LAN only — no STUN/TURN servers needed
         const config = {
             iceServers: [],
             bundlePolicy: 'max-bundle',
@@ -233,12 +156,35 @@
             return;
         }
 
+        // Incoming DataChannel from the phone (offerer creates it)
         pc.ondatachannel = (event) => {
             dc = event.channel;
             dc.binaryType = 'arraybuffer';
             report('DataChannel opened: ' + dc.label + ' ordered=' + dc.ordered);
 
-            dc.onmessage = onDataChannelMessage;
+            dc.onmessage = (evt) => {
+                const data = new Uint8Array(evt.data);
+                totalBytes += data.length;
+                fragments++;
+
+                if (!initReceived) {
+                    initReceived = true;
+                    lastInitSeg = data;
+                    report('Init segment: ' + data.length + ' bytes');
+                    createMSE(data);
+                    return;
+                }
+
+                // Detect re-init (resolution change) — ftyp box
+                if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+                    lastInitSeg = data;
+                    report('Re-init: ' + data.length + ' bytes');
+                    reinitMSE();
+                    return;
+                }
+
+                enqueue(data);
+            };
 
             dc.onclose = () => {
                 report('DataChannel closed');
@@ -250,6 +196,7 @@
             };
         };
 
+        // Send local ICE candidates to the phone via Cast namespace
         pc.onicecandidate = (event) => {
             if (event.candidate && senderBusId) {
                 try {
@@ -269,16 +216,18 @@
             if (st === 'connected' || st === 'completed') {
                 showStatus('Buffering…');
             } else if (st === 'failed') {
-                report('ICE failed — sending WEBRTC_UNSUPPORTED');
-                sendUnsupported();
+                report('ICE connection failed');
+                showStatus('Connection failed');
             } else if (st === 'disconnected') {
                 report('ICE disconnected — waiting for recovery');
             }
         };
 
+        // Set remote offer → create answer → send back via Cast
         pc.setRemoteDescription({ type: 'offer', sdp: offerSDP })
           .then(() => pc.createAnswer())
           .then(answer => {
+              // Increase SCTP max-message-size for large keyframe fragments
               let sdp = answer.sdp;
               if (sdp.indexOf('a=max-message-size:') !== -1) {
                   sdp = sdp.replace(/a=max-message-size:\d+/, 'a=max-message-size:262144');
@@ -305,101 +254,15 @@
         startLiveLoop();
     }
 
-    function onDataChannelMessage(evt) {
-        const data = new Uint8Array(evt.data);
-        totalBytes += data.length;
-        fragments++;
-
-        if (!initReceived) {
-            initReceived = true;
-            lastInitSeg = data;
-            report('Init segment (WebRTC): ' + data.length + ' bytes');
-            createMSE(data);
-            return;
-        }
-
-        if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-            lastInitSeg = data;
-            report('Re-init (WebRTC): ' + data.length + ' bytes');
-            reinitMSE();
-            return;
-        }
-
-        enqueue(data);
-    }
-
     function sendUnsupported() {
-        webrtcActive = false;
         if (senderBusId) {
             try { ctx.sendCustomMessage(NS, senderBusId, { type: 'WEBRTC_UNSUPPORTED' }); } catch(_) {}
         }
     }
 
-    function reconnectInternal(wsUrl) {
-        if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
-        if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(_){}
-        }
-        revokeURL();
-        mediaSource = null;
-        sourceBuffer = null;
-        queue = [];
-        appending = false;
-        initReceived = false;
-        hasPlayed = false;
-        playAttemptPending = false;
-
-        report('Reconnecting WS: ' + wsUrl);
-        showStatus('Reconnecting…');
-
-        ws = new WebSocket(wsUrl);
-        ws.binaryType = 'arraybuffer';
-        ws.onopen = () => {
-            report('WS reconnected');
-            reconnectCount = 0;
-            showStatus('Buffering…');
-        };
-        ws.onmessage = (evt) => {
-            const data = new Uint8Array(evt.data);
-            totalBytes += data.length;
-            fragments++;
-            if (!initReceived) {
-                initReceived = true;
-                lastInitSeg = data;
-                report('Init segment: ' + data.length + ' bytes');
-                createMSE(data);
-                return;
-            }
-            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-                lastInitSeg = data;
-                report('Re-init (resolution change): ' + data.length + ' bytes');
-                reinitMSE();
-                return;
-            }
-            enqueue(data);
-        };
-        ws.onerror = () => {
-            report('WS error');
-            showStatus('Connection error');
-        };
-        ws.onclose = () => {
-            report('WS closed (reconnect ' + reconnectCount + '/' + MAX_RECONNECTS + ')');
-            if (reconnectCount >= MAX_RECONNECTS) {
-                showStatus('Connection lost');
-                report('Max reconnects reached — giving up');
-                return;
-            }
-            reconnectCount++;
-            const delay = Math.min(500 * reconnectCount, 3000);
-            const url = wsUrl;
-            setTimeout(() => {
-                if (!ws || ws.readyState === WebSocket.CLOSED) {
-                    initReceived = false;
-                    reconnectInternal(url);
-                }
-            }, delay);
-        };
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // Stream Control
+    // ═══════════════════════════════════════════════════════════════
 
     function revokeURL() {
         if (lastObjectURL) {
@@ -409,10 +272,8 @@
     }
 
     function stopStream() {
-        if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
         if (dc) { try { dc.close(); } catch(_) {} dc = null; }
         if (pc) { try { pc.close(); } catch(_) {} pc = null; }
-        webrtcActive = false;
         if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
@@ -427,12 +288,15 @@
         initReceived = false;
         hasPlayed = false;
         playAttemptPending = false;
-        currentWsUrl = null;
         totalBytes = 0;
         fragments = 0;
         seekCount = 0;
         waitCount = 0;
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // MSE Pipeline (SourceBuffer playback)
+    // ═══════════════════════════════════════════════════════════════
 
     function createMSE(initSeg) {
         if (mediaSource && mediaSource.readyState === 'open') {
@@ -492,9 +356,7 @@
 
     function reinitMSE() {
         report('reinitMSE');
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send('FORCE_KEYFRAME');
-        } else if (dc && dc.readyState === 'open') {
+        if (dc && dc.readyState === 'open') {
             try { dc.send('FORCE_KEYFRAME'); } catch(_) {}
         }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
@@ -547,7 +409,6 @@
         drainQueue();
     }
 
-    let playAttemptPending = false;
     function attemptPlay() {
         if (hasPlayed || playAttemptPending) return;
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
@@ -590,6 +451,10 @@
             }
         } catch(_) {}
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Video Event Handlers
+    // ═══════════════════════════════════════════════════════════════
 
     video.addEventListener('waiting', () => {
         if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
@@ -634,6 +499,10 @@
             setTimeout(() => reinitMSE(), 300 * errorReinitCount);
         }
     });
+
+    // ═══════════════════════════════════════════════════════════════
+    // Live Loop & Diagnostics
+    // ═══════════════════════════════════════════════════════════════
 
     function startLiveLoop() {
         if (liveTimer) clearInterval(liveTimer);
@@ -699,13 +568,13 @@
                 ? ((totalBytes * 8) / ((Date.now() - streamStartTime) / 1000) / 1000).toFixed(0)
                 : '0';
 
-            const transport = webrtcActive ? 'WebRTC' : 'WS';
+            const iceState = pc ? pc.iceConnectionState : 'none';
 
             report('DIAG t=' + elapsed + 's ct=' + ct + ' ' + paused + ' ' + muted
                 + ' buf=[' + bufInfo + '] q=' + queue.length
                 + ' frags=' + fragments + ' ' + kbps + 'kbps'
                 + ' seeks=' + seekCount + ' waits=' + waitCount + dropInfo
-                + ' [' + transport + ']');
+                + ' ice=' + iceState);
         }, 5000);
     }
 
