@@ -79,11 +79,16 @@ function showStatus(text) {
 
 /** Send a message back to the phone via Cast namespace. */
 function send(obj) {
-    if (!senderID) return;
     try {
-        ctx.sendCustomMessage(NS, senderID, JSON.stringify(obj));
+        // Pass object directly — SDK handles JSON serialisation.
+        // Use senderID if known, otherwise broadcast (undefined).
+        ctx.sendCustomMessage(NS, senderID || undefined, obj);
     } catch (e) {
         log('sendCustomMessage error: ' + e);
+        // Fallback: try broadcast if targeted send failed
+        if (senderID) {
+            try { ctx.sendCustomMessage(NS, undefined, obj); } catch (e2) {}
+        }
     }
 }
 
@@ -97,6 +102,7 @@ function diag(text) {
 ctx.addCustomMessageListener(NS, function(event) {
     // Always track the sender so we can respond
     if (event.senderId) senderID = event.senderId;
+    log('MSG from=' + (event.senderId || 'unknown') + ' senderID=' + senderID);
 
     var msg;
     try {
@@ -358,8 +364,11 @@ function startDiagTimer() {
 }
 
 // ── Start Cast Receiver ─────────────────────────────────────
-ctx.start();
-log('Receiver v8 ready (WebRTC Video Track)');
+var opts = new cast.framework.CastReceiverOptions();
+opts.disableIdleTimeout = true;
+ctx.start(opts);
+log('Receiver v9 ready (WebRTC Video Track)');
+diag('Receiver v9 loaded');
 </script>
 </body>
 </html>
