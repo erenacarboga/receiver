@@ -3,14 +3,19 @@
 <head>
 <meta charset="utf-8">
 <!--
-  receiver.html — Chromecast Custom Receiver (WebRTC Video Track)
+  receiver.html v8 — Chromecast Custom Receiver (WebRTC Video Track)
 
   Architecture:
     Phone → WebRTC PeerConnection (video track / RTP) → This receiver
     pc.ontrack → video.srcObject = stream   ← NO MSE, NO SourceBuffer!
 
-  WebRTC handles all buffering, jitter compensation, and congestion control.
-  Typical end-to-end latency: 50-150 ms (vs 300-800 ms with DataChannel+MSE).
+  Signaling:
+    WEBRTC_OFFER  (phone→receiver) → SDP offer
+    WEBRTC_ANSWER (receiver→phone) → SDP answer
+    WEBRTC_ICE    (bidirectional)   → ICE candidates
+    SHOW_WELCOME  (phone→receiver) → welcome image URL (field: imageUrl)
+    STOP_STREAM   (phone→receiver) → tear down
+    SET_SOUND     (phone→receiver) → mute/unmute
 -->
 <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 <style>
@@ -51,25 +56,28 @@ video {
 'use strict';
 
 // ── Constants ───────────────────────────────────────────────
-const NS    = 'urn:x-cast:com.screenmirror.stream';
-const ctx   = cast.framework.CastReceiverContext.getInstance();
-const video = document.getElementById('video');
-const welc  = document.getElementById('welcome-img');
-const stat  = document.getElementById('status');
+var NS    = 'urn:x-cast:com.screenmirror.stream';
+var ctx   = cast.framework.CastReceiverContext.getInstance();
+var video = document.getElementById('video');
+var welc  = document.getElementById('welcome-img');
+var stat  = document.getElementById('status');
 
-let pc        = null;   // RTCPeerConnection
-let startTime = 0;
-let diagTimer = null;
-let senderID  = null;   // who sent the offer
+var RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+
+var pc        = null;
+var startTime = 0;
+var diagTimer = null;
+var senderID  = null;
 
 // ── Helpers ─────────────────────────────────────────────────
-function log(msg) { console.log('[RECV] ' + msg); }
+function log(m) { console.log('[RECV] ' + m); }
 
 function showStatus(text) {
     stat.textContent = text;
     stat.style.display = text ? 'block' : 'none';
 }
 
+/** Send a message back to the phone via Cast namespace. */
 function send(obj) {
     if (!senderID) return;
     try {
@@ -79,8 +87,17 @@ function send(obj) {
     }
 }
 
+/** Send a diagnostic/status message visible in phone logs as 📺 RECEIVER: */
+function diag(text) {
+    log(text);
+    send({ type: 'STATUS', msg: text });
+}
+
 // ── Cast Message Handler ────────────────────────────────────
 ctx.addCustomMessageListener(NS, function(event) {
+    // Always track the sender so we can respond
+    if (event.senderId) senderID = event.senderId;
+
     var msg;
     try {
         msg = typeof event.data === 'string'
@@ -90,10 +107,11 @@ ctx.addCustomMessageListener(NS, function(event) {
         return;
     }
 
-    switch (msg.type) {
+    var type = msg.type || '';
+
+    switch (type) {
         case 'WEBRTC_OFFER':
-            senderID = event.senderId;
-            handleOffer(msg.sdp);
+            handleOffer(msg.sdp, msg.soundEnabled);
             break;
 
         case 'WEBRTC_ICE':
@@ -102,6 +120,7 @@ ctx.addCustomMessageListener(NS, function(event) {
 
         case 'STOP_STREAM':
             stopStream();
+            diag('STOP_STREAM');
             break;
 
         case 'SHOW_WELCOME':
@@ -110,155 +129,187 @@ ctx.addCustomMessageListener(NS, function(event) {
 
         case 'SET_SOUND':
             video.muted = !msg.enabled;
-            log('Sound ' + (msg.enabled ? 'ON' : 'OFF'));
+            diag('Sound ' + (msg.enabled ? 'ON' : 'OFF'));
+            break;
+
+        default:
+            log('Unknown message type: ' + type);
             break;
     }
 });
 
 // ── WebRTC Offer → Answer ───────────────────────────────────
-function handleOffer(sdp) {
-    log('Offer received (' + sdp.length + ' chars)');
+function handleOffer(sdp, soundEnabled) {
+    diag('WEBRTC_OFFER received');
 
-    // Tear down previous session
-    stopStream();
+    // Check WebRTC support
+    if (!RTC) {
+        diag('WebRTC NOT supported on this device');
+        send({ type: 'WEBRTC_UNSUPPORTED' });
+        showStatus('WebRTC not supported');
+        return;
+    }
 
-    startTime = Date.now();
-    welc.style.display = 'none';
-    showStatus('Connecting…');
+    if (!sdp) {
+        diag('WEBRTC_OFFER: empty SDP');
+        return;
+    }
 
-    // Create PeerConnection
-    pc = new RTCPeerConnection({
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
-        ]
-    });
+    try {
+        // Tear down previous session
+        stopStream();
 
-    // ── Track arrives → play on <video> ──────────────────
-    pc.ontrack = function(event) {
-        log('Track: ' + event.track.kind +
-            ' (streams=' + event.streams.length + ')');
+        startTime = Date.now();
+        welc.style.display = 'none';
+        showStatus('Connecting…');
 
-        if (event.streams && event.streams[0]) {
-            video.srcObject = event.streams[0];
-        } else {
-            // Fallback: create new MediaStream
-            var ms = new MediaStream();
-            ms.addTrack(event.track);
-            video.srcObject = ms;
+        // Apply sound setting from offer
+        if (soundEnabled !== undefined) {
+            video.muted = !soundEnabled;
         }
 
-        video.play().then(function() {
-            log('Playback started');
-            showStatus('');
-        }).catch(function(e) {
-            log('play() error: ' + e);
-            // Retry muted
-            video.muted = true;
-            video.play().catch(function(e2) {
-                log('play() muted retry error: ' + e2);
-            });
-            showStatus('');
-        });
-    };
+        diag('Starting WebRTC peer connection');
 
-    // ── ICE candidates → send to phone ───────────────────
-    pc.onicecandidate = function(event) {
-        if (event.candidate) {
+        // Create PeerConnection
+        pc = new RTC({
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        });
+
+        // ── Track arrives → play on <video> ──────────────
+        pc.ontrack = function(ev) {
+            diag('Track: ' + ev.track.kind);
+
+            if (ev.streams && ev.streams[0]) {
+                video.srcObject = ev.streams[0];
+            } else {
+                var ms = new MediaStream();
+                ms.addTrack(ev.track);
+                video.srcObject = ms;
+            }
+
+            video.play().then(function() {
+                diag('PLAYING');
+                showStatus('');
+            }).catch(function(e) {
+                log('play() error: ' + e);
+                video.muted = true;
+                video.play().catch(function() {});
+                showStatus('');
+            });
+        };
+
+        // ── ICE candidates → send to phone ───────────────
+        pc.onicecandidate = function(ev) {
+            if (ev.candidate) {
+                send({
+                    type: 'WEBRTC_ICE',
+                    sdpMid: ev.candidate.sdpMid,
+                    sdpMLineIndex: ev.candidate.sdpMLineIndex,
+                    candidate: ev.candidate.candidate
+                });
+            }
+        };
+
+        // ── ICE state tracking ───────────────────────────
+        pc.oniceconnectionstatechange = function() {
+            var st = pc ? pc.iceConnectionState : 'null';
+            diag('ICE state: ' + st);
+            if (st === 'connected' || st === 'completed') {
+                showStatus('');
+                startDiagTimer();
+            } else if (st === 'failed') {
+                showStatus('Connection failed');
+            } else if (st === 'disconnected') {
+                showStatus('Reconnecting…');
+            }
+        };
+
+        // ── Apply offer → create answer → send back ─────
+        var desc = new (window.RTCSessionDescription || Object)({
+            type: 'offer', sdp: sdp
+        });
+
+        pc.setRemoteDescription(desc)
+        .then(function() {
+            log('Remote description set');
+            return pc.createAnswer();
+        })
+        .then(function(answer) {
+            log('Answer created');
+            return pc.setLocalDescription(answer);
+        })
+        .then(function() {
+            diag('WebRTC answer ready, sending to phone');
             send({
-                type: 'WEBRTC_ICE',
-                sdpMid: event.candidate.sdpMid,
-                sdpMLineIndex: event.candidate.sdpMLineIndex,
-                candidate: event.candidate.candidate
+                type: 'WEBRTC_ANSWER',
+                sdp: pc.localDescription.sdp
             });
-        }
-    };
-
-    // ── ICE state tracking ───────────────────────────────
-    pc.oniceconnectionstatechange = function() {
-        log('ICE: ' + pc.iceConnectionState);
-        if (pc.iceConnectionState === 'connected' ||
-            pc.iceConnectionState === 'completed') {
-            showStatus('');
-            startDiag();
-        } else if (pc.iceConnectionState === 'failed') {
-            showStatus('Connection failed');
-            send({ type: 'DIAG', data: 'ice=failed' });
-        } else if (pc.iceConnectionState === 'disconnected') {
-            showStatus('Reconnecting…');
-        }
-    };
-
-    pc.onconnectionstatechange = function() {
-        log('Connection: ' + pc.connectionState);
-    };
-
-    // ── Apply offer → create answer → send back ─────────
-    pc.setRemoteDescription({ type: 'offer', sdp: sdp })
-    .then(function() {
-        log('Remote description set');
-        return pc.createAnswer();
-    })
-    .then(function(answer) {
-        log('Answer created');
-        return pc.setLocalDescription(answer);
-    })
-    .then(function() {
-        send({
-            type: 'WEBRTC_ANSWER',
-            sdp: pc.localDescription.sdp
+        })
+        .catch(function(err) {
+            diag('SDP error: ' + err);
+            showStatus('Negotiation error');
         });
-        log('Answer sent (' + pc.localDescription.sdp.length +
-            ' chars)');
-    })
-    .catch(function(err) {
-        log('SDP negotiation error: ' + err);
-        showStatus('Negotiation error');
-        send({
-            type: 'DIAG',
-            data: 'sdp_error=' + err.toString().substring(0, 200)
-        });
-    });
+
+    } catch (e) {
+        diag('handleOffer exception: ' + e);
+        showStatus('WebRTC error');
+    }
 }
 
 // ── Remote ICE Candidate ────────────────────────────────────
 function handleIce(msg) {
     if (!pc) return;
-    pc.addIceCandidate({
-        sdpMid: msg.sdpMid,
-        sdpMLineIndex: msg.sdpMLineIndex,
-        candidate: msg.candidate
-    }).catch(function(e) {
-        log('addIceCandidate error: ' + e);
-    });
+    try {
+        var cand = new (window.RTCIceCandidate || Object)({
+            sdpMid: msg.sdpMid,
+            sdpMLineIndex: msg.sdpMLineIndex,
+            candidate: msg.candidate
+        });
+        pc.addIceCandidate(cand).catch(function(e) {
+            log('addIceCandidate error: ' + e);
+        });
+    } catch (e) {
+        log('handleIce exception: ' + e);
+    }
 }
 
 // ── Stop / Cleanup ──────────────────────────────────────────
 function stopStream() {
     if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
     if (pc) {
-        pc.close();
+        try { pc.close(); } catch (e) {}
         pc = null;
     }
     video.srcObject = null;
     showStatus('');
-    log('Stream stopped');
 }
 
 // ── Welcome Image ───────────────────────────────────────────
 function showWelcome(msg) {
-    if (msg.imageURL) {
-        welc.src = msg.imageURL;
-        welc.onload = function() { welc.style.display = 'block'; };
-        welc.onerror = function() { welc.style.display = 'none'; };
+    // GoogleCastService sends field "imageUrl" (camelCase)
+    var url = msg.imageUrl || msg.imageURL || '';
+    if (url) {
+        welc.src = url;
+        welc.onload = function() {
+            welc.style.display = 'block';
+            diag('SHOW_WELCOME: ' + url);
+        };
+        welc.onerror = function() {
+            welc.style.display = 'none';
+            diag('SHOW_WELCOME image load error: ' + url);
+        };
+    } else {
+        diag('SHOW_WELCOME: no imageUrl');
     }
-    // Hide video while showing welcome
     video.srcObject = null;
     showStatus('');
 }
 
-// ── Diagnostics (WebRTC Stats) ──────────────────────────────
-function startDiag() {
+// ── Diagnostics Timer (WebRTC Stats) ────────────────────────
+function startDiagTimer() {
     if (diagTimer) clearInterval(diagTimer);
 
     diagTimer = setInterval(function() {
@@ -288,7 +339,7 @@ function startDiag() {
                 }
             });
 
-            var diag = 't=' + elapsed + 's' +
+            var d = 't=' + elapsed + 's' +
                 ' ice=' + pc.iceConnectionState +
                 ' dec=' + dec +
                 ' drop=' + drop +
@@ -299,9 +350,7 @@ function startDiag() {
                 ' bytes=' + bytes +
                 (codec ? ' codec=' + codec : '');
 
-            log('[DIAG] ' + diag);
-
-            send({ type: 'DIAG', data: diag });
+            send({ type: 'DIAG', data: d });
         }).catch(function(e) {
             log('getStats error: ' + e);
         });
@@ -310,7 +359,7 @@ function startDiag() {
 
 // ── Start Cast Receiver ─────────────────────────────────────
 ctx.start();
-log('Receiver ready (WebRTC Video Track)');
+log('Receiver v8 ready (WebRTC Video Track)');
 </script>
 </body>
 </html>
