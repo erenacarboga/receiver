@@ -77,6 +77,17 @@
                 startStream('ws://' + u.hostname + ':8082/stream');
             } catch(e) { report('PLAY_HLS error: ' + e.message); }
         }
+        else if (d.type === 'WEBRTC_OFFER') {
+            report('WEBRTC_OFFER received — starting WebRTC DataChannel');
+            video.muted = (d.soundEnabled === false);
+            startWebRTC(d.sdp);
+        }
+        else if (d.type === 'WEBRTC_ICE') {
+            if (pc && d.candidate) {
+                pc.addIceCandidate({ candidate: d.candidate, sdpMid: d.sdpMid || '', sdpMLineIndex: d.sdpMLineIndex || 0 })
+                  .catch(e => report('addIceCandidate error: ' + e.message));
+            }
+        }
         else if (d.type === 'SHOW_WELCOME') { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
         else if (d.type === 'SET_SOUND')    { report('SET_SOUND: ' + d.enabled); video.muted = !d.enabled; }
     });
@@ -95,7 +106,7 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    report('Receiver v5 — WS+MSE (wall-clock DTS)');
+    report('Receiver v6 — WS+MSE / WebRTC DataChannel (UDP)');
 
     let ws = null;
     let mediaSource = null, sourceBuffer = null;
@@ -112,6 +123,10 @@
     let errorReinitCount = 0;
     let lastObjectURL = null;
     let currentWsUrl = null;
+
+    let pc = null;
+    let dc = null;
+    let webrtcActive = false;
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -191,6 +206,135 @@
         startLiveLoop();
     }
 
+    function startWebRTC(offerSDP) {
+        welcomeImg.style.display = 'none';
+        video.style.display = 'block';
+        showStatus('WebRTC connecting…');
+        stopStream();
+
+        webrtcActive = true;
+        reconnectCount = 0;
+        errorReinitCount = 0;
+        streamStartTime = Date.now();
+        report('Starting WebRTC peer connection');
+
+        const config = {
+            iceServers: [],
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require',
+            sdpSemantics: 'unified-plan'
+        };
+
+        try {
+            pc = new RTCPeerConnection(config);
+        } catch(e) {
+            report('RTCPeerConnection failed: ' + e.message);
+            sendUnsupported();
+            return;
+        }
+
+        pc.ondatachannel = (event) => {
+            dc = event.channel;
+            dc.binaryType = 'arraybuffer';
+            report('DataChannel opened: ' + dc.label + ' ordered=' + dc.ordered);
+
+            dc.onmessage = onDataChannelMessage;
+
+            dc.onclose = () => {
+                report('DataChannel closed');
+                showStatus('Stream ended');
+            };
+
+            dc.onerror = (e) => {
+                report('DataChannel error: ' + (e.error ? e.error.message : '?'));
+            };
+        };
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate && senderBusId) {
+                try {
+                    ctx.sendCustomMessage(NS, senderBusId, {
+                        type: 'WEBRTC_ICE',
+                        candidate: event.candidate.candidate,
+                        sdpMid: event.candidate.sdpMid,
+                        sdpMLineIndex: event.candidate.sdpMLineIndex
+                    });
+                } catch(_) {}
+            }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            const st = pc.iceConnectionState;
+            report('ICE state: ' + st);
+            if (st === 'connected' || st === 'completed') {
+                showStatus('Buffering…');
+            } else if (st === 'failed') {
+                report('ICE failed — sending WEBRTC_UNSUPPORTED');
+                sendUnsupported();
+            } else if (st === 'disconnected') {
+                report('ICE disconnected — waiting for recovery');
+            }
+        };
+
+        pc.setRemoteDescription({ type: 'offer', sdp: offerSDP })
+          .then(() => pc.createAnswer())
+          .then(answer => {
+              let sdp = answer.sdp;
+              if (sdp.indexOf('a=max-message-size:') !== -1) {
+                  sdp = sdp.replace(/a=max-message-size:\d+/, 'a=max-message-size:262144');
+              }
+              return pc.setLocalDescription({ type: 'answer', sdp: sdp });
+          })
+          .then(() => {
+              report('WebRTC answer ready, sending to phone');
+              try {
+                  ctx.sendCustomMessage(NS, senderBusId, {
+                      type: 'WEBRTC_ANSWER',
+                      sdp: pc.localDescription.sdp
+                  });
+              } catch(e) {
+                  report('Failed to send WEBRTC_ANSWER: ' + e.message);
+              }
+          })
+          .catch(e => {
+              report('WebRTC setup failed: ' + e.message);
+              sendUnsupported();
+          });
+
+        startDiag();
+        startLiveLoop();
+    }
+
+    function onDataChannelMessage(evt) {
+        const data = new Uint8Array(evt.data);
+        totalBytes += data.length;
+        fragments++;
+
+        if (!initReceived) {
+            initReceived = true;
+            lastInitSeg = data;
+            report('Init segment (WebRTC): ' + data.length + ' bytes');
+            createMSE(data);
+            return;
+        }
+
+        if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+            lastInitSeg = data;
+            report('Re-init (WebRTC): ' + data.length + ' bytes');
+            reinitMSE();
+            return;
+        }
+
+        enqueue(data);
+    }
+
+    function sendUnsupported() {
+        webrtcActive = false;
+        if (senderBusId) {
+            try { ctx.sendCustomMessage(NS, senderBusId, { type: 'WEBRTC_UNSUPPORTED' }); } catch(_) {}
+        }
+    }
+
     function reconnectInternal(wsUrl) {
         if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
@@ -266,6 +410,9 @@
 
     function stopStream() {
         if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
+        if (dc) { try { dc.close(); } catch(_) {} dc = null; }
+        if (pc) { try { pc.close(); } catch(_) {} pc = null; }
+        webrtcActive = false;
         if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
@@ -347,6 +494,8 @@
         report('reinitMSE');
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send('FORCE_KEYFRAME');
+        } else if (dc && dc.readyState === 'open') {
+            try { dc.send('FORCE_KEYFRAME'); } catch(_) {}
         }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
@@ -550,10 +699,13 @@
                 ? ((totalBytes * 8) / ((Date.now() - streamStartTime) / 1000) / 1000).toFixed(0)
                 : '0';
 
+            const transport = webrtcActive ? 'WebRTC' : 'WS';
+
             report('DIAG t=' + elapsed + 's ct=' + ct + ' ' + paused + ' ' + muted
                 + ' buf=[' + bufInfo + '] q=' + queue.length
                 + ' frags=' + fragments + ' ' + kbps + 'kbps'
-                + ' seeks=' + seekCount + ' waits=' + waitCount + dropInfo);
+                + ' seeks=' + seekCount + ' waits=' + waitCount + dropInfo
+                + ' [' + transport + ']');
         }, 5000);
     }
 
