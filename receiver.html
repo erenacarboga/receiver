@@ -93,7 +93,7 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    report('Receiver v9 — WebRTC DataChannel (UDP/SCTP/DTLS)');
+    report('Receiver v7 — WebRTC DataChannel (UDP/SCTP/DTLS)');
 
     // ═══════════════════════════════════════════════════════════════
     // State
@@ -140,6 +140,7 @@
         streamStartTime = Date.now();
         report('Starting WebRTC peer connection');
 
+        // LAN only — no STUN/TURN servers needed
         const config = {
             iceServers: [],
             bundlePolicy: 'max-bundle',
@@ -155,6 +156,7 @@
             return;
         }
 
+        // Incoming DataChannel from the phone (offerer creates it)
         pc.ondatachannel = (event) => {
             dc = event.channel;
             dc.binaryType = 'arraybuffer';
@@ -194,6 +196,7 @@
             };
         };
 
+        // Send local ICE candidates to the phone via Cast namespace
         pc.onicecandidate = (event) => {
             if (event.candidate && senderBusId) {
                 try {
@@ -220,9 +223,11 @@
             }
         };
 
+        // Set remote offer → create answer → send back via Cast
         pc.setRemoteDescription({ type: 'offer', sdp: offerSDP })
           .then(() => pc.createAnswer())
           .then(answer => {
+              // Increase SCTP max-message-size for large keyframe fragments
               let sdp = answer.sdp;
               if (sdp.indexOf('a=max-message-size:') !== -1) {
                   sdp = sdp.replace(/a=max-message-size:\d+/, 'a=max-message-size:262144');
@@ -359,6 +364,7 @@
             try { mediaSource.endOfStream(); } catch(_){}
         }
         revokeURL();
+        // Fully reset video element to clear stale decoder pipeline
         video.removeAttribute('src');
         video.load();
         mediaSource = null;
@@ -372,6 +378,7 @@
     }
 
     function enqueue(data) {
+        // Drop fragments while MSE is initializing or in bad state
         if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return;
         if (queue.length >= 12) {
             const drop = queue.length - 4;
@@ -397,7 +404,7 @@
             if (e.name === 'QuotaExceededError') {
                 trimBuffer();
             } else if (e.name === 'InvalidStateError') {
-                queue = [];
+                queue = [];  // MSE in bad state — stop trying, wait for reinit
             }
         }
     }
