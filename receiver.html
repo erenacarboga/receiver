@@ -466,8 +466,23 @@
 
     video.addEventListener('waiting', () => {
         if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const nRanges = sourceBuffer.buffered.length;
+        const edge = sourceBuffer.buffered.end(nRanges - 1);
         const drift = edge - video.currentTime;
+
+        // If buffer is fragmented (2+ ranges) and playhead is in/before a gap,
+        // jump to the start of the latest contiguous range to skip past the gap.
+        if (nRanges >= 2) {
+            const lastStart = sourceBuffer.buffered.start(nRanges - 1);
+            if (video.currentTime < lastStart) {
+                video.currentTime = lastStart + 0.05;
+                seekCount++;
+                waitCount++;
+                report('waiting → gap-skip to ' + lastStart.toFixed(3) + ' ranges=' + nRanges);
+                return;
+            }
+        }
+
         if (drift > 0.3) {
             // Buffer exists ahead — seek to safe margin
             video.currentTime = edge - 0.25;
@@ -483,8 +498,21 @@
 
     video.addEventListener('stalled', () => {
         if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const nRanges = sourceBuffer.buffered.length;
+        const edge = sourceBuffer.buffered.end(nRanges - 1);
         const drift = edge - video.currentTime;
+
+        // Gap-skip: if fragmented, jump past the gap
+        if (nRanges >= 2) {
+            const lastStart = sourceBuffer.buffered.start(nRanges - 1);
+            if (video.currentTime < lastStart) {
+                video.currentTime = lastStart + 0.05;
+                seekCount++;
+                report('stalled → gap-skip to ' + lastStart.toFixed(3));
+                return;
+            }
+        }
+
         if (drift > 0.3) {
             video.currentTime = edge - 0.25;
         } else if (drift > 0) {
@@ -567,8 +595,27 @@
                 }
             }
 
-            if (hasPlayed && sourceBuffer.buffered.length > 3) {
-                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+            // Proactive gap-skip: if buffer has 2+ ranges and playhead is
+            // approaching a gap, jump past it BEFORE waiting event fires.
+            const nRanges = sourceBuffer.buffered.length;
+            if (hasPlayed && nRanges >= 2) {
+                // Find the gap the playhead is about to hit
+                for (let i = 0; i < nRanges - 1; i++) {
+                    const rangeEnd = sourceBuffer.buffered.end(i);
+                    const nextStart = sourceBuffer.buffered.start(i + 1);
+                    // If playhead is within 0.15s of the gap boundary, skip it
+                    if (ct >= rangeEnd - 0.15 && ct < nextStart) {
+                        video.currentTime = nextStart + 0.05;
+                        seekCount++;
+                        report('liveLoop → gap-skip ' + rangeEnd.toFixed(2) + '→' + nextStart.toFixed(2));
+                        break;
+                    }
+                }
+            }
+
+            // If buffer is severely fragmented (4+ ranges), full reinit
+            if (hasPlayed && nRanges >= 4) {
+                report('Fragmented buffer (' + nRanges + ' ranges) — reinit');
                 reinitMSE();
             }
 
