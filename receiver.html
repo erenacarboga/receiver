@@ -1,607 +1,316 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <style>
-        html, body {
-            margin: 0; padding: 0;
-            width: 100%; height: 100%;
-            background: #000; overflow: hidden;
-        }
-        video {
-            width: 100%; height: 100%;
-            object-fit: contain;
-            background: #000;
-        }
-        #welcome-img {
-            display: none;
-            position: fixed; top: 0; left: 0;
-            width: 100%; height: 100%;
-            object-fit: contain;
-            background: #000;
-            z-index: 5;
-        }
-        #status {
-            position: fixed; top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
-            color: #fff; font: 24px -apple-system, sans-serif;
-            text-align: center;
-            display: none;
-            z-index: 10;
-            pointer-events: none;
-        }
-    </style>
+<meta charset="utf-8">
+<!--
+  receiver.html — Chromecast Custom Receiver (WebRTC Video Track)
+
+  Architecture:
+    Phone → WebRTC PeerConnection (video track / RTP) → This receiver
+    pc.ontrack → video.srcObject = stream   ← NO MSE, NO SourceBuffer!
+
+  WebRTC handles all buffering, jitter compensation, and congestion control.
+  Typical end-to-end latency: 50-150 ms (vs 300-800 ms with DataChannel+MSE).
+-->
+<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<style>
+html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+}
+video {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+#welcome-img {
+    display: none;
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    background: #000;
+    z-index: 5;
+}
+#status {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: #fff; font: 24px -apple-system, sans-serif;
+    text-align: center;
+    display: none;
+    z-index: 10;
+}
+</style>
 </head>
 <body>
-    <div id="status">Waiting for stream…</div>
-    <img id="welcome-img" />
-    <video id="v" autoplay playsinline></video>
-    <script>
-    'use strict';
+<img id="welcome-img" />
+<video id="video" autoplay playsinline muted></video>
+<div id="status"></div>
 
-    const NS  = 'urn:x-cast:com.screenmirror.stream';
-    const TAG = '[SMReceiver]';
+<script>
+'use strict';
 
-    const statusEl   = document.getElementById('status');
-    const video      = document.getElementById('v');
-    const welcomeImg = document.getElementById('welcome-img');
+// ── Constants ───────────────────────────────────────────────
+const NS    = 'urn:x-cast:com.screenmirror.stream';
+const ctx   = cast.framework.CastReceiverContext.getInstance();
+const video = document.getElementById('video');
+const welc  = document.getElementById('welcome-img');
+const stat  = document.getElementById('status');
 
-    const ctx = cast.framework.CastReceiverContext.getInstance();
-    const pm  = ctx.getPlayerManager();
-    let senderBusId = null;
+let pc        = null;   // RTCPeerConnection
+let startTime = 0;
+let diagTimer = null;
+let senderID  = null;   // who sent the offer
 
-    function report(msg) {
-        console.log(TAG, msg);
-        if (senderBusId) {
-            try { ctx.sendCustomMessage(NS, senderBusId, {type:'DIAG', msg:msg}); } catch(_){}
-        }
+// ── Helpers ─────────────────────────────────────────────────
+function log(msg) { console.log('[RECV] ' + msg); }
+
+function showStatus(text) {
+    stat.textContent = text;
+    stat.style.display = text ? 'block' : 'none';
+}
+
+function send(obj) {
+    if (!senderID) return;
+    try {
+        ctx.sendCustomMessage(NS, senderID, JSON.stringify(obj));
+    } catch (e) {
+        log('sendCustomMessage error: ' + e);
     }
-    function showStatus(text) { statusEl.textContent = text; statusEl.style.display = 'block'; }
-    function hideStatus() { statusEl.style.display = 'none'; }
+}
 
-    // ═══════════════════════════════════════════════════════════════
-    // Cast Message Handling
-    // ═══════════════════════════════════════════════════════════════
+// ── Cast Message Handler ────────────────────────────────────
+ctx.addCustomMessageListener(NS, function(event) {
+    var msg;
+    try {
+        msg = typeof event.data === 'string'
+            ? JSON.parse(event.data) : event.data;
+    } catch (e) {
+        log('Bad JSON: ' + e);
+        return;
+    }
 
-    ctx.addCustomMessageListener(NS, event => {
-        senderBusId = event.senderId;
-        const d = event.data;
-        if (d.type === 'WEBRTC_OFFER') {
-            report('WEBRTC_OFFER received');
-            video.muted = (d.soundEnabled === false);
-            startWebRTC(d.sdp);
-        }
-        else if (d.type === 'WEBRTC_ICE') {
-            if (pc && d.candidate) {
-                pc.addIceCandidate({ candidate: d.candidate, sdpMid: d.sdpMid || '', sdpMLineIndex: d.sdpMLineIndex || 0 })
-                  .catch(e => report('addIceCandidate error: ' + e.message));
-            }
-        }
-        else if (d.type === 'STOP_STREAM')  { stopStream(); }
-        else if (d.type === 'SHOW_WELCOME') { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
-        else if (d.type === 'SET_SOUND')    { report('SET_SOUND: ' + d.enabled); video.muted = !d.enabled; }
+    switch (msg.type) {
+        case 'WEBRTC_OFFER':
+            senderID = event.senderId;
+            handleOffer(msg.sdp);
+            break;
+
+        case 'WEBRTC_ICE':
+            handleIce(msg);
+            break;
+
+        case 'STOP_STREAM':
+            stopStream();
+            break;
+
+        case 'SHOW_WELCOME':
+            showWelcome(msg);
+            break;
+
+        case 'SET_SOUND':
+            video.muted = !msg.enabled;
+            log('Sound ' + (msg.enabled ? 'ON' : 'OFF'));
+            break;
+    }
+});
+
+// ── WebRTC Offer → Answer ───────────────────────────────────
+function handleOffer(sdp) {
+    log('Offer received (' + sdp.length + ' chars)');
+
+    // Tear down previous session
+    stopStream();
+
+    startTime = Date.now();
+    welc.style.display = 'none';
+    showStatus('Connecting…');
+
+    // Create PeerConnection
+    pc = new RTCPeerConnection({
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
     });
 
-    pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, req => {
-        return null;
+    // ── Track arrives → play on <video> ──────────────────
+    pc.ontrack = function(event) {
+        log('Track: ' + event.track.kind +
+            ' (streams=' + event.streams.length + ')');
+
+        if (event.streams && event.streams[0]) {
+            video.srcObject = event.streams[0];
+        } else {
+            // Fallback: create new MediaStream
+            var ms = new MediaStream();
+            ms.addTrack(event.track);
+            video.srcObject = ms;
+        }
+
+        video.play().then(function() {
+            log('Playback started');
+            showStatus('');
+        }).catch(function(e) {
+            log('play() error: ' + e);
+            // Retry muted
+            video.muted = true;
+            video.play().catch(function(e2) {
+                log('play() muted retry error: ' + e2);
+            });
+            showStatus('');
+        });
+    };
+
+    // ── ICE candidates → send to phone ───────────────────
+    pc.onicecandidate = function(event) {
+        if (event.candidate) {
+            send({
+                type: 'WEBRTC_ICE',
+                sdpMid: event.candidate.sdpMid,
+                sdpMLineIndex: event.candidate.sdpMLineIndex,
+                candidate: event.candidate.candidate
+            });
+        }
+    };
+
+    // ── ICE state tracking ───────────────────────────────
+    pc.oniceconnectionstatechange = function() {
+        log('ICE: ' + pc.iceConnectionState);
+        if (pc.iceConnectionState === 'connected' ||
+            pc.iceConnectionState === 'completed') {
+            showStatus('');
+            startDiag();
+        } else if (pc.iceConnectionState === 'failed') {
+            showStatus('Connection failed');
+            send({ type: 'DIAG', data: 'ice=failed' });
+        } else if (pc.iceConnectionState === 'disconnected') {
+            showStatus('Reconnecting…');
+        }
+    };
+
+    pc.onconnectionstatechange = function() {
+        log('Connection: ' + pc.connectionState);
+    };
+
+    // ── Apply offer → create answer → send back ─────────
+    pc.setRemoteDescription({ type: 'offer', sdp: sdp })
+    .then(function() {
+        log('Remote description set');
+        return pc.createAnswer();
+    })
+    .then(function(answer) {
+        log('Answer created');
+        return pc.setLocalDescription(answer);
+    })
+    .then(function() {
+        send({
+            type: 'WEBRTC_ANSWER',
+            sdp: pc.localDescription.sdp
+        });
+        log('Answer sent (' + pc.localDescription.sdp.length +
+            ' chars)');
+    })
+    .catch(function(err) {
+        log('SDP negotiation error: ' + err);
+        showStatus('Negotiation error');
+        send({
+            type: 'DIAG',
+            data: 'sdp_error=' + err.toString().substring(0, 200)
+        });
     });
+}
 
-    const opts = new cast.framework.CastReceiverOptions();
-    opts.disableIdleTimeout = true;
-    opts.statusText = '';
-    opts.customNamespaces = {};
-    opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
-    ctx.start(opts);
-    report('Receiver v7 — WebRTC DataChannel (UDP/SCTP/DTLS)');
+// ── Remote ICE Candidate ────────────────────────────────────
+function handleIce(msg) {
+    if (!pc) return;
+    pc.addIceCandidate({
+        sdpMid: msg.sdpMid,
+        sdpMLineIndex: msg.sdpMLineIndex,
+        candidate: msg.candidate
+    }).catch(function(e) {
+        log('addIceCandidate error: ' + e);
+    });
+}
 
-    // ═══════════════════════════════════════════════════════════════
-    // State
-    // ═══════════════════════════════════════════════════════════════
-
-    let pc = null;           // RTCPeerConnection
-    let dc = null;           // RTCDataChannel
-    let mediaSource = null, sourceBuffer = null;
-    let queue = [], appending = false, initReceived = false;
-    let lastInitSeg = null;
-    let hasPlayed = false;
-    let diagTimer = null, statusTimer = null, liveTimer = null;
-    let streamStartTime = 0;
-    let totalBytes = 0, fragments = 0;
-    let seekCount = 0, waitCount = 0;
-    let lastDropped = 0, lastTotal = 0;
-    let errorReinitCount = 0;
-    let lastObjectURL = null;
-    let playAttemptPending = false;
-
-    // ═══════════════════════════════════════════════════════════════
-    // Welcome Image
-    // ═══════════════════════════════════════════════════════════════
-
-    function showWelcome(imageUrl) {
-        stopStream();
-        welcomeImg.src = imageUrl;
-        welcomeImg.style.display = 'block';
-        video.style.display = 'none';
-        hideStatus();
+// ── Stop / Cleanup ──────────────────────────────────────────
+function stopStream() {
+    if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+    if (pc) {
+        pc.close();
+        pc = null;
     }
+    video.srcObject = null;
+    showStatus('');
+    log('Stream stopped');
+}
 
-    // ═══════════════════════════════════════════════════════════════
-    // WebRTC DataChannel Transport (UDP/SCTP/DTLS)
-    // ═══════════════════════════════════════════════════════════════
+// ── Welcome Image ───────────────────────────────────────────
+function showWelcome(msg) {
+    if (msg.imageURL) {
+        welc.src = msg.imageURL;
+        welc.onload = function() { welc.style.display = 'block'; };
+        welc.onerror = function() { welc.style.display = 'none'; };
+    }
+    // Hide video while showing welcome
+    video.srcObject = null;
+    showStatus('');
+}
 
-    function startWebRTC(offerSDP) {
-        welcomeImg.style.display = 'none';
-        video.style.display = 'block';
-        showStatus('Connecting…');
-        stopStream();
+// ── Diagnostics (WebRTC Stats) ──────────────────────────────
+function startDiag() {
+    if (diagTimer) clearInterval(diagTimer);
 
-        errorReinitCount = 0;
-        streamStartTime = Date.now();
-        report('Starting WebRTC peer connection');
+    diagTimer = setInterval(function() {
+        if (!pc) return;
+        var elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-        // LAN only — no STUN/TURN servers needed
-        const config = {
-            iceServers: [],
-            bundlePolicy: 'max-bundle',
-            rtcpMuxPolicy: 'require',
-            sdpSemantics: 'unified-plan'
-        };
+        pc.getStats().then(function(stats) {
+            var dec = 0, drop = 0, bytes = 0, jitter = 0;
+            var rtt = 0, width = 0, height = 0, fps = 0;
+            var codec = '';
 
-        try {
-            pc = new RTCPeerConnection(config);
-        } catch(e) {
-            report('RTCPeerConnection failed: ' + e.message);
-            sendUnsupported();
-            return;
-        }
-
-        // Incoming DataChannel from the phone (offerer creates it)
-        pc.ondatachannel = (event) => {
-            dc = event.channel;
-            dc.binaryType = 'arraybuffer';
-            report('DataChannel opened: ' + dc.label + ' ordered=' + dc.ordered);
-
-            dc.onmessage = (evt) => {
-                const data = new Uint8Array(evt.data);
-                totalBytes += data.length;
-                fragments++;
-
-                if (!initReceived) {
-                    initReceived = true;
-                    lastInitSeg = data;
-                    report('Init segment: ' + data.length + ' bytes');
-                    createMSE(data);
-                    return;
+            stats.forEach(function(r) {
+                if (r.type === 'inbound-rtp' && r.kind === 'video') {
+                    dec   = r.framesDecoded  || 0;
+                    drop  = r.framesDropped  || 0;
+                    bytes = r.bytesReceived  || 0;
+                    jitter = r.jitter        || 0;
+                    fps   = r.framesPerSecond || 0;
+                    if (r.frameWidth)  width  = r.frameWidth;
+                    if (r.frameHeight) height = r.frameHeight;
                 }
-
-                // Detect re-init (resolution change) — ftyp box
-                if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
-                    lastInitSeg = data;
-                    report('Re-init: ' + data.length + ' bytes');
-                    reinitMSE();
-                    return;
+                if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+                    rtt = r.currentRoundTripTime || 0;
                 }
-
-                enqueue(data);
-            };
-
-            dc.onclose = () => {
-                report('DataChannel closed');
-                showStatus('Stream ended');
-            };
-
-            dc.onerror = (e) => {
-                report('DataChannel error: ' + (e.error ? e.error.message : '?'));
-            };
-        };
-
-        // Send local ICE candidates to the phone via Cast namespace
-        pc.onicecandidate = (event) => {
-            if (event.candidate && senderBusId) {
-                try {
-                    ctx.sendCustomMessage(NS, senderBusId, {
-                        type: 'WEBRTC_ICE',
-                        candidate: event.candidate.candidate,
-                        sdpMid: event.candidate.sdpMid,
-                        sdpMLineIndex: event.candidate.sdpMLineIndex
-                    });
-                } catch(_) {}
-            }
-        };
-
-        pc.oniceconnectionstatechange = () => {
-            const st = pc.iceConnectionState;
-            report('ICE state: ' + st);
-            if (st === 'connected' || st === 'completed') {
-                showStatus('Buffering…');
-            } else if (st === 'failed') {
-                report('ICE connection failed');
-                showStatus('Connection failed');
-            } else if (st === 'disconnected') {
-                report('ICE disconnected — waiting for recovery');
-            }
-        };
-
-        // Set remote offer → create answer → send back via Cast
-        pc.setRemoteDescription({ type: 'offer', sdp: offerSDP })
-          .then(() => pc.createAnswer())
-          .then(answer => {
-              // Increase SCTP max-message-size for large keyframe fragments
-              let sdp = answer.sdp;
-              if (sdp.indexOf('a=max-message-size:') !== -1) {
-                  sdp = sdp.replace(/a=max-message-size:\d+/, 'a=max-message-size:262144');
-              }
-              return pc.setLocalDescription({ type: 'answer', sdp: sdp });
-          })
-          .then(() => {
-              report('WebRTC answer ready, sending to phone');
-              try {
-                  ctx.sendCustomMessage(NS, senderBusId, {
-                      type: 'WEBRTC_ANSWER',
-                      sdp: pc.localDescription.sdp
-                  });
-              } catch(e) {
-                  report('Failed to send WEBRTC_ANSWER: ' + e.message);
-              }
-          })
-          .catch(e => {
-              report('WebRTC setup failed: ' + e.message);
-              sendUnsupported();
-          });
-
-        startDiag();
-        startLiveLoop();
-    }
-
-    function sendUnsupported() {
-        if (senderBusId) {
-            try { ctx.sendCustomMessage(NS, senderBusId, { type: 'WEBRTC_UNSUPPORTED' }); } catch(_) {}
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // Stream Control
-    // ═══════════════════════════════════════════════════════════════
-
-    function revokeURL() {
-        if (lastObjectURL) {
-            URL.revokeObjectURL(lastObjectURL);
-            lastObjectURL = null;
-        }
-    }
-
-    function stopStream() {
-        if (dc) { try { dc.close(); } catch(_) {} dc = null; }
-        if (pc) { try { pc.close(); } catch(_) {} pc = null; }
-        if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
-        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-        if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
-        if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(_){}
-        }
-        revokeURL();
-        mediaSource = null;
-        sourceBuffer = null;
-        queue = [];
-        appending = false;
-        initReceived = false;
-        hasPlayed = false;
-        playAttemptPending = false;
-        totalBytes = 0;
-        fragments = 0;
-        seekCount = 0;
-        waitCount = 0;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // MSE Pipeline (SourceBuffer playback)
-    // ═══════════════════════════════════════════════════════════════
-
-    function createMSE(initSeg) {
-        if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(_){}
-        }
-        mediaSource = null;
-        sourceBuffer = null;
-        queue = [];
-        appending = false;
-
-        mediaSource = new MediaSource();
-        mediaSource.addEventListener('sourceopen', () => {
-            report('MSE sourceopen');
-
-            const codec = detectCodec(initSeg) || 'avc1.640029,mp4a.40.2';
-            report('Codec: ' + codec);
-
-            try {
-                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
-            } catch(e) {
-                report('addSourceBuffer failed: ' + e.message + ', trying fallback');
-                try {
-                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E,mp4a.40.2"');
-                } catch(e2) {
-                    report('All codec attempts failed: ' + e2.message);
-                    return;
+                if (r.type === 'codec' && r.mimeType) {
+                    codec = r.mimeType;
                 }
-            }
-
-            sourceBuffer.mode = 'sequence';
-            sourceBuffer.addEventListener('updateend', onUpdateEnd);
-            sourceBuffer.addEventListener('error', () => {
-                report('SourceBuffer error');
-                queue = [];
-                appending = false;
             });
 
-            queue.unshift(initSeg);
-            drainQueue();
+            var diag = 't=' + elapsed + 's' +
+                ' ice=' + pc.iceConnectionState +
+                ' dec=' + dec +
+                ' drop=' + drop +
+                ' fps=' + fps +
+                ' ' + width + 'x' + height +
+                ' jitter=' + (jitter * 1000).toFixed(1) + 'ms' +
+                ' rtt=' + (rtt * 1000).toFixed(0) + 'ms' +
+                ' bytes=' + bytes +
+                (codec ? ' codec=' + codec : '');
 
-            statusTimer = setInterval(() => {
-                attemptPlay();
-                if (hasPlayed && statusTimer) {
-                    clearInterval(statusTimer);
-                    statusTimer = null;
-                }
-            }, 150);
+            log('[DIAG] ' + diag);
+
+            send({ type: 'DIAG', data: diag });
+        }).catch(function(e) {
+            log('getStats error: ' + e);
         });
+    }, 5000);
+}
 
-        mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
-        mediaSource.addEventListener('sourceclose', () => report('MSE sourceclose'));
-
-        revokeURL();
-        lastObjectURL = URL.createObjectURL(mediaSource);
-        video.src = lastObjectURL;
-    }
-
-    function reinitMSE() {
-        report('reinitMSE');
-        if (dc && dc.readyState === 'open') {
-            try { dc.send('FORCE_KEYFRAME'); } catch(_) {}
-        }
-        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-        if (mediaSource && mediaSource.readyState === 'open') {
-            try { mediaSource.endOfStream(); } catch(_){}
-        }
-        revokeURL();
-        // Fully reset video element to clear stale decoder pipeline
-        video.removeAttribute('src');
-        video.load();
-        mediaSource = null;
-        sourceBuffer = null;
-        queue = [];
-        appending = false;
-        hasPlayed = false;
-        playAttemptPending = false;
-        errorReinitCount = 0;
-        if (lastInitSeg) createMSE(lastInitSeg);
-    }
-
-    function enqueue(data) {
-        // Drop fragments while MSE is initializing or in bad state
-        if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return;
-        if (queue.length >= 12) {
-            const drop = queue.length - 4;
-            queue.splice(0, drop);
-            report('Dropped ' + drop + ' queued fragments (backpressure)');
-        }
-        queue.push(data);
-        drainQueue();
-    }
-
-    function drainQueue() {
-        if (appending || !sourceBuffer || queue.length === 0) return;
-        if (sourceBuffer.updating) return;
-        if (!mediaSource || mediaSource.readyState !== 'open') { queue = []; return; }
-
-        appending = true;
-        const chunk = queue.shift();
-        try {
-            sourceBuffer.appendBuffer(chunk);
-        } catch(e) {
-            appending = false;
-            report('appendBuffer error: ' + e.name);
-            if (e.name === 'QuotaExceededError') {
-                trimBuffer();
-            } else if (e.name === 'InvalidStateError') {
-                queue = [];  // MSE in bad state — stop trying, wait for reinit
-            }
-        }
-    }
-
-    function onUpdateEnd() {
-        appending = false;
-        if (!hasPlayed && sourceBuffer && sourceBuffer.buffered.length > 0) {
-            attemptPlay();
-        }
-        drainQueue();
-    }
-
-    function attemptPlay() {
-        if (hasPlayed || playAttemptPending) return;
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const start = sourceBuffer.buffered.start(0);
-        if (edge - start < 0.3) return;
-
-        playAttemptPending = true;
-        video.currentTime = Math.max(edge - 0.25, start);
-
-        video.play().then(() => {
-            hasPlayed = true;
-            playAttemptPending = false;
-            hideStatus();
-            report('PLAYING ct=' + video.currentTime.toFixed(3));
-        }).catch(e => {
-            report('play() error: ' + (e ? e.name : '?'));
-            if (!video.muted) {
-                video.muted = true;
-                video.play().then(() => {
-                    hasPlayed = true;
-                    playAttemptPending = false;
-                    hideStatus();
-                    video.muted = false;
-                    report('PLAYING (muted workaround)');
-                }).catch(() => { playAttemptPending = false; });
-            } else {
-                playAttemptPending = false;
-            }
-        });
-    }
-
-    function trimBuffer() {
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0 || sourceBuffer.updating) return;
-        try {
-            const start = sourceBuffer.buffered.start(0);
-            const keep = Math.max(start, video.currentTime - 1.0);
-            if (keep > start + 0.5) {
-                sourceBuffer.remove(start, keep);
-            }
-        } catch(_) {}
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // Video Event Handlers
-    // ═══════════════════════════════════════════════════════════════
-
-    video.addEventListener('waiting', () => {
-        if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const drift = edge - video.currentTime;
-        if (drift > 0.15) {
-            video.currentTime = edge - 0.15;
-            seekCount++;
-            waitCount++;
-            report('waiting → seek edge=' + edge.toFixed(3) + ' drift=' + drift.toFixed(2));
-        }
-    });
-
-    video.addEventListener('stalled', () => {
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        if (edge - video.currentTime > 0.15) {
-            video.currentTime = edge - 0.15;
-        }
-    });
-
-    video.addEventListener('canplay', () => {
-        report('canplay rs=' + video.readyState);
-        if (!hasPlayed) attemptPlay();
-    });
-
-    video.addEventListener('playing', () => {
-        hideStatus();
-        if (!hasPlayed) { hasPlayed = true; playAttemptPending = false; }
-    });
-
-    video.addEventListener('error', () => {
-        const err = video.error;
-        report('video error: code=' + (err ? err.code : '?') + ' reinits=' + errorReinitCount);
-        errorReinitCount++;
-        if (errorReinitCount > 5) {
-            report('Too many error reinits — stopping');
-            showStatus('Playback error');
-            return;
-        }
-        if (lastInitSeg) {
-            setTimeout(() => reinitMSE(), 300 * errorReinitCount);
-        }
-    });
-
-    // ═══════════════════════════════════════════════════════════════
-    // Live Loop & Diagnostics
-    // ═══════════════════════════════════════════════════════════════
-
-    function startLiveLoop() {
-        if (liveTimer) clearInterval(liveTimer);
-        liveTimer = setInterval(() => {
-            if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-            if (video.paused && hasPlayed) video.play().catch(() => {});
-
-            const ct = video.currentTime;
-            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-            const drift = edge - ct;
-
-            if (drift > 0.5 && hasPlayed) {
-                video.currentTime = edge - 0.1;
-                seekCount++;
-            }
-
-            if (!sourceBuffer.updating && hasPlayed) {
-                const bufStart = sourceBuffer.buffered.start(0);
-                const removeEnd = ct - 2.0;
-                if (removeEnd > bufStart + 0.5) {
-                    try { sourceBuffer.remove(bufStart, removeEnd); } catch(_) {}
-                }
-            }
-
-            if (hasPlayed && sourceBuffer.buffered.length > 3) {
-                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
-                reinitMSE();
-            }
-
-            if (hasPlayed && !video.paused && drift < 0.5) {
-                errorReinitCount = 0;
-            }
-        }, 200);
-    }
-
-    function startDiag() {
-        if (diagTimer) clearInterval(diagTimer);
-        diagTimer = setInterval(() => {
-            const elapsed = ((Date.now() - streamStartTime) / 1000).toFixed(1);
-            const ct = video.currentTime.toFixed(2);
-            const paused = video.paused ? 'PAUSED' : 'playing';
-            const muted = video.muted ? 'muted' : 'unmuted';
-
-            let bufInfo = 'none';
-            if (sourceBuffer && sourceBuffer.buffered.length > 0) {
-                const bs = sourceBuffer.buffered.start(0).toFixed(2);
-                const be = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1).toFixed(2);
-                bufInfo = bs + '-' + be + '(' + sourceBuffer.buffered.length + ')';
-            }
-
-            let dropInfo = '';
-            if (video.getVideoPlaybackQuality) {
-                const q = video.getVideoPlaybackQuality();
-                const nd = q.droppedVideoFrames - lastDropped;
-                const nt = q.totalVideoFrames - lastTotal;
-                dropInfo = ' drop=' + q.droppedVideoFrames + '/' + q.totalVideoFrames
-                    + '(+' + nd + '/' + nt + ')';
-                lastDropped = q.droppedVideoFrames;
-                lastTotal = q.totalVideoFrames;
-            }
-
-            const kbps = streamStartTime > 0
-                ? ((totalBytes * 8) / ((Date.now() - streamStartTime) / 1000) / 1000).toFixed(0)
-                : '0';
-
-            const iceState = pc ? pc.iceConnectionState : 'none';
-
-            report('DIAG t=' + elapsed + 's ct=' + ct + ' ' + paused + ' ' + muted
-                + ' buf=[' + bufInfo + '] q=' + queue.length
-                + ' frags=' + fragments + ' ' + kbps + 'kbps'
-                + ' seeks=' + seekCount + ' waits=' + waitCount + dropInfo
-                + ' ice=' + iceState);
-        }, 5000);
-    }
-
-    function detectCodec(d) {
-        let videoCodec = null, hasAudio = false;
-        for (let i = 0; i < d.length - 4; i++) {
-            if (!videoCodec && i + 7 < d.length &&
-                d[i]===0x61 && d[i+1]===0x76 && d[i+2]===0x63 && d[i+3]===0x43) {
-                if (d[i+4] === 1) {
-                    const h = n => n.toString(16).padStart(2, '0');
-                    videoCodec = 'avc1.' + h(d[i+5]) + h(d[i+6]) + h(d[i+7]);
-                }
-            }
-            if (d[i]===0x6D && d[i+1]===0x70 && d[i+2]===0x34 && d[i+3]===0x61) hasAudio = true;
-            if (d[i]===0x65 && d[i+1]===0x73 && d[i+2]===0x64 && d[i+3]===0x73) hasAudio = true;
-        }
-        if (videoCodec && (hasAudio || d.length > 800)) return videoCodec + ',mp4a.40.2';
-        return videoCodec;
-    }
-    </script>
+// ── Start Cast Receiver ─────────────────────────────────────
+ctx.start();
+log('Receiver ready (WebRTC Video Track)');
+</script>
 </body>
 </html>
