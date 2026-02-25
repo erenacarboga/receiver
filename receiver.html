@@ -26,12 +26,11 @@
             position: fixed; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
             color: #fff; font: 24px -apple-system, sans-serif;
-            text-align: center; opacity: 0;
-            transition: opacity 0.4s;
+            text-align: center;
+            display: none;
             z-index: 10;
             pointer-events: none;
         }
-        #status.visible { opacity: 0.8; }
     </style>
 </head>
 <body>
@@ -58,8 +57,8 @@
             try { ctx.sendCustomMessage(NS, senderBusId, {type:'DIAG', msg:msg}); } catch(_){}
         }
     }
-    function showStatus(text) { statusEl.textContent = text; statusEl.classList.add('visible'); }
-    function hideStatus() { statusEl.classList.remove('visible'); }
+    function showStatus(text) { statusEl.textContent = text; statusEl.style.display = 'block'; }
+    function hideStatus() { statusEl.style.display = 'none'; }
 
     ctx.addCustomMessageListener(NS, event => {
         senderBusId = event.senderId;
@@ -103,11 +102,16 @@
     let queue = [], appending = false, initReceived = false;
     let lastInitSeg = null;
     let hasPlayed = false;
-    let diagTimer = null, statusTimer = null;
+    let diagTimer = null, statusTimer = null, liveTimer = null;
     let streamStartTime = 0;
     let totalBytes = 0, fragments = 0;
     let seekCount = 0, waitCount = 0;
     let lastDropped = 0, lastTotal = 0;
+    let reconnectCount = 0;
+    const MAX_RECONNECTS = 15;
+    let errorReinitCount = 0;
+    let lastObjectURL = null;
+    let currentWsUrl = null;
 
     function showWelcome(imageUrl) {
         stopStream();
@@ -123,6 +127,9 @@
         showStatus('Connecting…');
         stopStream();
 
+        currentWsUrl = wsUrl;
+        reconnectCount = 0;
+        errorReinitCount = 0;
         report('Connecting WS: ' + wsUrl);
 
         ws = new WebSocket(wsUrl);
@@ -162,33 +169,118 @@
         };
 
         ws.onclose = () => {
-            report('WS closed');
+            report('WS closed (reconnect ' + reconnectCount + '/' + MAX_RECONNECTS + ')');
+            if (reconnectCount >= MAX_RECONNECTS) {
+                showStatus('Connection lost');
+                report('Max reconnects reached — giving up');
+                return;
+            }
+            reconnectCount++;
+            const delay = Math.min(500 * reconnectCount, 3000);
             const url = wsUrl;
             setTimeout(() => {
                 if (!ws || ws.readyState === WebSocket.CLOSED) {
                     initReceived = false;
-                    startStream(url);
+                    reconnectInternal(url);
                 }
-            }, 500);
+            }, delay);
         };
 
         streamStartTime = Date.now();
         startDiag();
+        startLiveLoop();
     }
 
-    function stopStream() {
+    function reconnectInternal(wsUrl) {
         if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
-        if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
-        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (mediaSource && mediaSource.readyState === 'open') {
             try { mediaSource.endOfStream(); } catch(_){}
         }
+        revokeURL();
         mediaSource = null;
         sourceBuffer = null;
         queue = [];
         appending = false;
         initReceived = false;
         hasPlayed = false;
+        playAttemptPending = false;
+
+        report('Reconnecting WS: ' + wsUrl);
+        showStatus('Reconnecting…');
+
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => {
+            report('WS reconnected');
+            reconnectCount = 0;
+            showStatus('Buffering…');
+        };
+        ws.onmessage = (evt) => {
+            const data = new Uint8Array(evt.data);
+            totalBytes += data.length;
+            fragments++;
+            if (!initReceived) {
+                initReceived = true;
+                lastInitSeg = data;
+                report('Init segment: ' + data.length + ' bytes');
+                createMSE(data);
+                return;
+            }
+            if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+                lastInitSeg = data;
+                report('Re-init (resolution change): ' + data.length + ' bytes');
+                reinitMSE();
+                return;
+            }
+            enqueue(data);
+        };
+        ws.onerror = () => {
+            report('WS error');
+            showStatus('Connection error');
+        };
+        ws.onclose = () => {
+            report('WS closed (reconnect ' + reconnectCount + '/' + MAX_RECONNECTS + ')');
+            if (reconnectCount >= MAX_RECONNECTS) {
+                showStatus('Connection lost');
+                report('Max reconnects reached — giving up');
+                return;
+            }
+            reconnectCount++;
+            const delay = Math.min(500 * reconnectCount, 3000);
+            const url = wsUrl;
+            setTimeout(() => {
+                if (!ws || ws.readyState === WebSocket.CLOSED) {
+                    initReceived = false;
+                    reconnectInternal(url);
+                }
+            }, delay);
+        };
+    }
+
+    function revokeURL() {
+        if (lastObjectURL) {
+            URL.revokeObjectURL(lastObjectURL);
+            lastObjectURL = null;
+        }
+    }
+
+    function stopStream() {
+        if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null; }
+        if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+        if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        revokeURL();
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        initReceived = false;
+        hasPlayed = false;
+        playAttemptPending = false;
+        currentWsUrl = null;
         totalBytes = 0;
         fragments = 0;
         seekCount = 0;
@@ -246,7 +338,9 @@
         mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
         mediaSource.addEventListener('sourceclose', () => report('MSE sourceclose'));
 
-        video.src = URL.createObjectURL(mediaSource);
+        revokeURL();
+        lastObjectURL = URL.createObjectURL(mediaSource);
+        video.src = lastObjectURL;
     }
 
     function reinitMSE() {
@@ -258,11 +352,13 @@
         if (mediaSource && mediaSource.readyState === 'open') {
             try { mediaSource.endOfStream(); } catch(_){}
         }
+        revokeURL();
         mediaSource = null;
         sourceBuffer = null;
         queue = [];
         appending = false;
         hasPlayed = false;
+        playAttemptPending = false;
         if (lastInitSeg) createMSE(lastInitSeg);
     }
 
@@ -302,16 +398,20 @@
         drainQueue();
     }
 
+    let playAttemptPending = false;
     function attemptPlay() {
-        if (hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        if (hasPlayed || playAttemptPending) return;
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
         const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
         const start = sourceBuffer.buffered.start(0);
         if (edge - start < 0.05) return;
 
+        playAttemptPending = true;
         video.currentTime = Math.max(edge - 0.1, start);
 
         video.play().then(() => {
             hasPlayed = true;
+            playAttemptPending = false;
             hideStatus();
             report('PLAYING ct=' + video.currentTime.toFixed(3));
         }).catch(e => {
@@ -320,10 +420,13 @@
                 video.muted = true;
                 video.play().then(() => {
                     hasPlayed = true;
+                    playAttemptPending = false;
                     hideStatus();
                     video.muted = false;
                     report('PLAYING (muted workaround)');
-                }).catch(() => {});
+                }).catch(() => { playAttemptPending = false; });
+            } else {
+                playAttemptPending = false;
             }
         });
     }
@@ -364,40 +467,58 @@
         if (!hasPlayed) attemptPlay();
     });
 
-    video.addEventListener('playing', () => hideStatus());
+    video.addEventListener('playing', () => {
+        hideStatus();
+        if (!hasPlayed) { hasPlayed = true; playAttemptPending = false; }
+    });
 
     video.addEventListener('error', () => {
         const err = video.error;
-        report('video error: code=' + (err ? err.code : '?'));
-        if (lastInitSeg) reinitMSE();
+        report('video error: code=' + (err ? err.code : '?') + ' reinits=' + errorReinitCount);
+        errorReinitCount++;
+        if (errorReinitCount > 5) {
+            report('Too many error reinits — stopping');
+            showStatus('Playback error');
+            return;
+        }
+        if (lastInitSeg) {
+            setTimeout(() => reinitMSE(), 300 * errorReinitCount);
+        }
     });
 
-    setInterval(() => {
-        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
-        if (video.paused && hasPlayed) video.play().catch(() => {});
+    function startLiveLoop() {
+        if (liveTimer) clearInterval(liveTimer);
+        liveTimer = setInterval(() => {
+            if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+            if (video.paused && hasPlayed) video.play().catch(() => {});
 
-        const ct = video.currentTime;
-        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
-        const drift = edge - ct;
+            const ct = video.currentTime;
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            const drift = edge - ct;
 
-        if (drift > 0.5 && hasPlayed) {
-            video.currentTime = edge - 0.05;
-            seekCount++;
-        }
-
-        if (!sourceBuffer.updating) {
-            const bufStart = sourceBuffer.buffered.start(0);
-            const removeEnd = ct - 2.0;
-            if (removeEnd > bufStart + 0.5) {
-                try { sourceBuffer.remove(bufStart, removeEnd); } catch(_) {}
+            if (drift > 0.5 && hasPlayed) {
+                video.currentTime = edge - 0.05;
+                seekCount++;
             }
-        }
 
-        if (sourceBuffer.buffered.length > 3) {
-            report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
-            reinitMSE();
-        }
-    }, 200);
+            if (!sourceBuffer.updating && hasPlayed) {
+                const bufStart = sourceBuffer.buffered.start(0);
+                const removeEnd = ct - 2.0;
+                if (removeEnd > bufStart + 0.5) {
+                    try { sourceBuffer.remove(bufStart, removeEnd); } catch(_) {}
+                }
+            }
+
+            if (hasPlayed && sourceBuffer.buffered.length > 3) {
+                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+                reinitMSE();
+            }
+
+            if (hasPlayed && !video.paused && drift < 0.5) {
+                errorReinitCount = 0;
+            }
+        }, 200);
+    }
 
     function startDiag() {
         if (diagTimer) clearInterval(diagTimer);
