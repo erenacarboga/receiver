@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <!--
-  receiver.html v8 — Chromecast Custom Receiver (WebRTC Video Track)
+  receiver.html v9 — Chromecast Custom Receiver (WebRTC Video Track)
 
   Architecture:
     Phone → WebRTC PeerConnection (video track / RTP) → This receiver
@@ -176,13 +176,9 @@ function handleOffer(sdp, soundEnabled) {
 
         diag('Starting WebRTC peer connection');
 
-        // Create PeerConnection
-        pc = new RTC({
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:stun1.l.google.com:19302' }
-            ]
-        });
+        // Create PeerConnection — no STUN servers needed for same-LAN.
+        // Removing STUN forces direct host candidates → <5ms RTT.
+        pc = new RTC({ iceServers: [] });
 
         // ── Track arrives → play on <video> ──────────────
         pc.ontrack = function(ev) {
@@ -326,22 +322,43 @@ function startDiagTimer() {
             var dec = 0, drop = 0, bytes = 0, jitter = 0;
             var rtt = 0, width = 0, height = 0, fps = 0;
             var codec = '';
+            var localType = '', remoteType = '', localAddr = '', remoteAddr = '';
+            var selectedPairId = '';
 
+            // First pass: find the selected candidate-pair
+            stats.forEach(function(r) {
+                if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated)) {
+                    rtt = r.currentRoundTripTime || 0;
+                    selectedPairId = r.id;
+                    // Resolve candidate types
+                    var lc = r.localCandidateId ? stats.get(r.localCandidateId) : null;
+                    var rc = r.remoteCandidateId ? stats.get(r.remoteCandidateId) : null;
+                    if (lc) { localType = lc.candidateType || ''; localAddr = (lc.address||lc.ip||'') + ':' + (lc.port||''); }
+                    if (rc) { remoteType = rc.candidateType || ''; remoteAddr = (rc.address||rc.ip||'') + ':' + (rc.port||''); }
+                }
+            });
+
+            // Second pass: get the main video inbound-rtp (not RTX)
             stats.forEach(function(r) {
                 if (r.type === 'inbound-rtp' && r.kind === 'video') {
-                    dec   = r.framesDecoded  || 0;
-                    drop  = r.framesDropped  || 0;
-                    bytes = r.bytesReceived  || 0;
-                    jitter = r.jitter        || 0;
-                    fps   = r.framesPerSecond || 0;
-                    if (r.frameWidth)  width  = r.frameWidth;
-                    if (r.frameHeight) height = r.frameHeight;
-                }
-                if (r.type === 'candidate-pair' && r.state === 'succeeded') {
-                    rtt = r.currentRoundTripTime || 0;
-                }
-                if (r.type === 'codec' && r.mimeType) {
-                    codec = r.mimeType;
+                    // Skip RTX retransmission stream — it has 0 framesDecoded
+                    if (r.framesDecoded > 0 || dec === 0) {
+                        var fd = r.framesDecoded || 0;
+                        if (fd > dec) {
+                            dec   = fd;
+                            drop  = r.framesDropped  || 0;
+                            bytes = r.bytesReceived  || 0;
+                            jitter = r.jitter        || 0;
+                            fps   = r.framesPerSecond || 0;
+                            if (r.frameWidth)  width  = r.frameWidth;
+                            if (r.frameHeight) height = r.frameHeight;
+                            // Get the real codec for this stream
+                            if (r.codecId) {
+                                var c = stats.get(r.codecId);
+                                if (c && c.mimeType) codec = c.mimeType;
+                            }
+                        }
+                    }
                 }
             });
 
@@ -354,7 +371,10 @@ function startDiagTimer() {
                 ' jitter=' + (jitter * 1000).toFixed(1) + 'ms' +
                 ' rtt=' + (rtt * 1000).toFixed(0) + 'ms' +
                 ' bytes=' + bytes +
-                (codec ? ' codec=' + codec : '');
+                (codec ? ' codec=' + codec : '') +
+                ' pair=' + localType + '→' + remoteType +
+                ' local=' + localAddr +
+                ' remote=' + remoteAddr;
 
             send({ type: 'DIAG', data: d });
         }).catch(function(e) {
