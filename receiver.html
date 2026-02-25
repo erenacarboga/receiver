@@ -50,7 +50,6 @@
     const ctx = cast.framework.CastReceiverContext.getInstance();
     const pm  = ctx.getPlayerManager();
     let senderBusId = null;
-    let soundEnabled = true;
 
     function report(msg) {
         console.log(TAG, msg);
@@ -70,7 +69,7 @@
         const d = event.data;
         if (d.type === 'WEBRTC_OFFER') {
             report('WEBRTC_OFFER received');
-            soundEnabled = d.soundEnabled !== false;
+            video.muted = (d.soundEnabled === false);
             startWebRTC(d.sdp);
         }
         else if (d.type === 'WEBRTC_ICE') {
@@ -81,11 +80,7 @@
         }
         else if (d.type === 'STOP_STREAM')  { stopStream(); }
         else if (d.type === 'SHOW_WELCOME') { report('SHOW_WELCOME: ' + d.imageUrl); showWelcome(d.imageUrl); }
-        else if (d.type === 'SET_SOUND')    {
-            soundEnabled = !!d.enabled;
-            if (audioEl) audioEl.muted = !soundEnabled;
-            report('SET_SOUND: ' + d.enabled);
-        }
+        else if (d.type === 'SET_SOUND')    { report('SET_SOUND: ' + d.enabled); video.muted = !d.enabled; }
     });
 
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, req => {
@@ -98,25 +93,26 @@
     opts.customNamespaces = {};
     opts.customNamespaces[NS] = cast.framework.system.MessageType.JSON;
     ctx.start(opts);
-    report('Receiver v8 — WebRTC Video Track (SRTP/UDP) + DataChannel Audio');
+    report('Receiver v9 — WebRTC DataChannel (UDP/SCTP/DTLS)');
 
     // ═══════════════════════════════════════════════════════════════
     // State
     // ═══════════════════════════════════════════════════════════════
 
     let pc = null;           // RTCPeerConnection
-    let dc = null;           // RTCDataChannel (audio)
-
-    // Audio MSE state
-    let audioEl = null, audioMS = null, audioSB = null;
-    let audioQueue = [], audioAppending = false, audioInitReceived = false;
-    let lastAudioInitSeg = null;
-    let lastObjectURL = null;
-
+    let dc = null;           // RTCDataChannel
+    let mediaSource = null, sourceBuffer = null;
+    let queue = [], appending = false, initReceived = false;
+    let lastInitSeg = null;
     let hasPlayed = false;
-    let diagTimer = null, liveTimer = null;
+    let diagTimer = null, statusTimer = null, liveTimer = null;
     let streamStartTime = 0;
     let totalBytes = 0, fragments = 0;
+    let seekCount = 0, waitCount = 0;
+    let lastDropped = 0, lastTotal = 0;
+    let errorReinitCount = 0;
+    let lastObjectURL = null;
+    let playAttemptPending = false;
 
     // ═══════════════════════════════════════════════════════════════
     // Welcome Image
@@ -131,7 +127,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // WebRTC: Native Video Track + DataChannel Audio
+    // WebRTC DataChannel Transport (UDP/SCTP/DTLS)
     // ═══════════════════════════════════════════════════════════════
 
     function startWebRTC(offerSDP) {
@@ -140,8 +136,9 @@
         showStatus('Connecting…');
         stopStream();
 
+        errorReinitCount = 0;
         streamStartTime = Date.now();
-        report('Starting WebRTC (native video track mode)');
+        report('Starting WebRTC peer connection');
 
         const config = {
             iceServers: [],
@@ -158,30 +155,6 @@
             return;
         }
 
-        // ── Video: native WebRTC track → video.srcObject ──
-        pc.ontrack = (event) => {
-            const kind = event.track.kind;
-            report('Track received: kind=' + kind + ' id=' + event.track.id);
-            if (kind === 'video') {
-                video.srcObject = event.streams[0] || new MediaStream([event.track]);
-                video.muted = true;  // Audio comes from DataChannel, not video element
-                video.play().then(() => {
-                    hasPlayed = true;
-                    hideStatus();
-                    report('VIDEO PLAYING via native WebRTC track');
-                }).catch(e => {
-                    report('play error: ' + e.message);
-                    video.muted = true;
-                    video.play().then(() => {
-                        hasPlayed = true;
-                        hideStatus();
-                        report('PLAYING (muted retry)');
-                    }).catch(() => {});
-                });
-            }
-        };
-
-        // ── Audio: DataChannel → fMP4 MSE (hidden element) ──
         pc.ondatachannel = (event) => {
             dc = event.channel;
             dc.binaryType = 'arraybuffer';
@@ -192,30 +165,35 @@
                 totalBytes += data.length;
                 fragments++;
 
-                if (!audioInitReceived && isFtyp(data)) {
-                    audioInitReceived = true;
-                    lastAudioInitSeg = data;
-                    report('Audio init segment: ' + data.length + ' bytes');
-                    setupAudioMSE(data);
+                if (!initReceived) {
+                    initReceived = true;
+                    lastInitSeg = data;
+                    report('Init segment: ' + data.length + ' bytes');
+                    createMSE(data);
                     return;
                 }
 
-                // Re-init on new init segment (resolution change)
-                if (isFtyp(data)) {
-                    lastAudioInitSeg = data;
-                    report('Audio re-init: ' + data.length + ' bytes');
-                    reinitAudioMSE();
+                // Detect re-init (resolution change) — ftyp box
+                if (data.length > 7 && data[4]===0x66 && data[5]===0x74 && data[6]===0x79 && data[7]===0x70) {
+                    lastInitSeg = data;
+                    report('Re-init: ' + data.length + ' bytes');
+                    reinitMSE();
                     return;
                 }
 
-                audioEnqueue(data);
+                enqueue(data);
             };
 
-            dc.onclose = () => report('DataChannel closed');
-            dc.onerror = (e) => report('DataChannel error: ' + (e.error ? e.error.message : '?'));
+            dc.onclose = () => {
+                report('DataChannel closed');
+                showStatus('Stream ended');
+            };
+
+            dc.onerror = (e) => {
+                report('DataChannel error: ' + (e.error ? e.error.message : '?'));
+            };
         };
 
-        // ICE candidates → relay to phone via Cast namespace
         pc.onicecandidate = (event) => {
             if (event.candidate && senderBusId) {
                 try {
@@ -233,7 +211,7 @@
             const st = pc.iceConnectionState;
             report('ICE state: ' + st);
             if (st === 'connected' || st === 'completed') {
-                showStatus('Receiving…');
+                showStatus('Buffering…');
             } else if (st === 'failed') {
                 report('ICE connection failed');
                 showStatus('Connection failed');
@@ -242,7 +220,6 @@
             }
         };
 
-        // SDP exchange: set remote offer → create answer → send back
         pc.setRemoteDescription({ type: 'offer', sdp: offerSDP })
           .then(() => pc.createAnswer())
           .then(answer => {
@@ -278,151 +255,250 @@
         }
     }
 
-    function isFtyp(d) {
-        return d.length > 7 && d[4]===0x66 && d[5]===0x74 && d[6]===0x79 && d[7]===0x70;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // Audio MSE Pipeline (DataChannel → hidden SourceBuffer)
-    // ═══════════════════════════════════════════════════════════════
-
-    function setupAudioMSE(initSeg) {
-        cleanupAudio();
-
-        audioEl = document.createElement('video');
-        audioEl.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none';
-        audioEl.muted = !soundEnabled;
-        audioEl.autoplay = true;
-        document.body.appendChild(audioEl);
-
-        audioMS = new MediaSource();
-        audioMS.addEventListener('sourceopen', () => {
-            const codec = detectCodec(initSeg) || 'avc1.640029,mp4a.40.2';
-            report('Audio MSE codec: ' + codec);
-
-            try {
-                audioSB = audioMS.addSourceBuffer('video/mp4; codecs="' + codec + '"');
-            } catch(e) {
-                report('Audio addSourceBuffer failed: ' + e.message);
-                try {
-                    audioSB = audioMS.addSourceBuffer('video/mp4; codecs="mp4a.40.2"');
-                } catch(e2) {
-                    report('Audio codec fallback failed: ' + e2.message);
-                    return;
-                }
-            }
-
-            audioSB.mode = 'sequence';
-            audioSB.addEventListener('updateend', () => {
-                audioAppending = false;
-                audioDrainQueue();
-            });
-            audioSB.addEventListener('error', () => {
-                report('Audio SourceBuffer error');
-                audioQueue = [];
-                audioAppending = false;
-            });
-
-            audioQueue.unshift(initSeg);
-            audioDrainQueue();
-
-            // Start audio playback after brief buffer
-            setTimeout(() => {
-                if (audioEl && audioSB && audioSB.buffered.length > 0) {
-                    const edge = audioSB.buffered.end(audioSB.buffered.length - 1);
-                    audioEl.currentTime = Math.max(edge - 0.1, 0);
-                    audioEl.play().catch(() => {});
-                }
-            }, 500);
-        });
-
-        audioMS.addEventListener('sourceclose', () => report('Audio MSE sourceclose'));
-
-        lastObjectURL = URL.createObjectURL(audioMS);
-        audioEl.src = lastObjectURL;
-    }
-
-    function reinitAudioMSE() {
-        if (lastAudioInitSeg) setupAudioMSE(lastAudioInitSeg);
-    }
-
-    function audioEnqueue(data) {
-        if (!audioSB || !audioMS || audioMS.readyState !== 'open') return;
-        if (audioQueue.length >= 30) {
-            audioQueue.splice(0, audioQueue.length - 10);
-        }
-        audioQueue.push(data);
-        audioDrainQueue();
-    }
-
-    function audioDrainQueue() {
-        if (audioAppending || !audioSB || audioQueue.length === 0) return;
-        if (audioSB.updating) return;
-        if (!audioMS || audioMS.readyState !== 'open') { audioQueue = []; return; }
-
-        audioAppending = true;
-        try {
-            audioSB.appendBuffer(audioQueue.shift());
-        } catch(e) {
-            audioAppending = false;
-            if (e.name === 'QuotaExceededError') {
-                audioTrimBuffer();
-            } else if (e.name === 'InvalidStateError') {
-                audioQueue = [];
-            }
-        }
-    }
-
-    function audioTrimBuffer() {
-        if (!audioSB || audioSB.buffered.length === 0 || audioSB.updating) return;
-        try {
-            const s = audioSB.buffered.start(0);
-            const keep = Math.max(s, (audioEl ? audioEl.currentTime : 0) - 2.0);
-            if (keep > s + 0.5) audioSB.remove(s, keep);
-        } catch(_) {}
-    }
-
-    function cleanupAudio() {
-        if (audioMS && audioMS.readyState === 'open') {
-            try { audioMS.endOfStream(); } catch(_) {}
-        }
-        if (lastObjectURL) { URL.revokeObjectURL(lastObjectURL); lastObjectURL = null; }
-        if (audioEl) { audioEl.remove(); audioEl = null; }
-        audioMS = null;
-        audioSB = null;
-        audioQueue = [];
-        audioAppending = false;
-    }
-
     // ═══════════════════════════════════════════════════════════════
     // Stream Control
     // ═══════════════════════════════════════════════════════════════
+
+    function revokeURL() {
+        if (lastObjectURL) {
+            URL.revokeObjectURL(lastObjectURL);
+            lastObjectURL = null;
+        }
+    }
 
     function stopStream() {
         if (dc) { try { dc.close(); } catch(_) {} dc = null; }
         if (pc) { try { pc.close(); } catch(_) {} pc = null; }
         if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
-        cleanupAudio();
-        video.srcObject = null;
-        audioInitReceived = false;
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        revokeURL();
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        initReceived = false;
         hasPlayed = false;
+        playAttemptPending = false;
         totalBytes = 0;
         fragments = 0;
+        seekCount = 0;
+        waitCount = 0;
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Video Event Handlers (minimal — WebRTC handles most things)
+    // MSE Pipeline (SourceBuffer playback)
     // ═══════════════════════════════════════════════════════════════
+
+    function createMSE(initSeg) {
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+
+        mediaSource = new MediaSource();
+        mediaSource.addEventListener('sourceopen', () => {
+            report('MSE sourceopen');
+
+            const codec = detectCodec(initSeg) || 'avc1.640029,mp4a.40.2';
+            report('Codec: ' + codec);
+
+            try {
+                sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+            } catch(e) {
+                report('addSourceBuffer failed: ' + e.message + ', trying fallback');
+                try {
+                    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E,mp4a.40.2"');
+                } catch(e2) {
+                    report('All codec attempts failed: ' + e2.message);
+                    return;
+                }
+            }
+
+            sourceBuffer.mode = 'sequence';
+            sourceBuffer.addEventListener('updateend', onUpdateEnd);
+            sourceBuffer.addEventListener('error', () => {
+                report('SourceBuffer error');
+                queue = [];
+                appending = false;
+            });
+
+            queue.unshift(initSeg);
+            drainQueue();
+
+            statusTimer = setInterval(() => {
+                attemptPlay();
+                if (hasPlayed && statusTimer) {
+                    clearInterval(statusTimer);
+                    statusTimer = null;
+                }
+            }, 150);
+        });
+
+        mediaSource.addEventListener('sourceended', () => report('MSE sourceended'));
+        mediaSource.addEventListener('sourceclose', () => report('MSE sourceclose'));
+
+        revokeURL();
+        lastObjectURL = URL.createObjectURL(mediaSource);
+        video.src = lastObjectURL;
+    }
+
+    function reinitMSE() {
+        report('reinitMSE');
+        if (dc && dc.readyState === 'open') {
+            try { dc.send('FORCE_KEYFRAME'); } catch(_) {}
+        }
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+        if (mediaSource && mediaSource.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch(_){}
+        }
+        revokeURL();
+        video.removeAttribute('src');
+        video.load();
+        mediaSource = null;
+        sourceBuffer = null;
+        queue = [];
+        appending = false;
+        hasPlayed = false;
+        playAttemptPending = false;
+        errorReinitCount = 0;
+        if (lastInitSeg) createMSE(lastInitSeg);
+    }
+
+    function enqueue(data) {
+        if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return;
+        if (queue.length >= 12) {
+            const drop = queue.length - 4;
+            queue.splice(0, drop);
+            report('Dropped ' + drop + ' queued fragments (backpressure)');
+        }
+        queue.push(data);
+        drainQueue();
+    }
+
+    function drainQueue() {
+        if (appending || !sourceBuffer || queue.length === 0) return;
+        if (sourceBuffer.updating) return;
+        if (!mediaSource || mediaSource.readyState !== 'open') { queue = []; return; }
+
+        appending = true;
+        const chunk = queue.shift();
+        try {
+            sourceBuffer.appendBuffer(chunk);
+        } catch(e) {
+            appending = false;
+            report('appendBuffer error: ' + e.name);
+            if (e.name === 'QuotaExceededError') {
+                trimBuffer();
+            } else if (e.name === 'InvalidStateError') {
+                queue = [];
+            }
+        }
+    }
+
+    function onUpdateEnd() {
+        appending = false;
+        if (!hasPlayed && sourceBuffer && sourceBuffer.buffered.length > 0) {
+            attemptPlay();
+        }
+        drainQueue();
+    }
+
+    function attemptPlay() {
+        if (hasPlayed || playAttemptPending) return;
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const start = sourceBuffer.buffered.start(0);
+        if (edge - start < 0.3) return;
+
+        playAttemptPending = true;
+        video.currentTime = Math.max(edge - 0.25, start);
+
+        video.play().then(() => {
+            hasPlayed = true;
+            playAttemptPending = false;
+            hideStatus();
+            report('PLAYING ct=' + video.currentTime.toFixed(3));
+        }).catch(e => {
+            report('play() error: ' + (e ? e.name : '?'));
+            if (!video.muted) {
+                video.muted = true;
+                video.play().then(() => {
+                    hasPlayed = true;
+                    playAttemptPending = false;
+                    hideStatus();
+                    video.muted = false;
+                    report('PLAYING (muted workaround)');
+                }).catch(() => { playAttemptPending = false; });
+            } else {
+                playAttemptPending = false;
+            }
+        });
+    }
+
+    function trimBuffer() {
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0 || sourceBuffer.updating) return;
+        try {
+            const start = sourceBuffer.buffered.start(0);
+            const keep = Math.max(start, video.currentTime - 1.0);
+            if (keep > start + 0.5) {
+                sourceBuffer.remove(start, keep);
+            }
+        } catch(_) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Video Event Handlers
+    // ═══════════════════════════════════════════════════════════════
+
+    video.addEventListener('waiting', () => {
+        if (!hasPlayed || !sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        const drift = edge - video.currentTime;
+        if (drift > 0.15) {
+            video.currentTime = edge - 0.15;
+            seekCount++;
+            waitCount++;
+            report('waiting → seek edge=' + edge.toFixed(3) + ' drift=' + drift.toFixed(2));
+        }
+    });
+
+    video.addEventListener('stalled', () => {
+        if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+        const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+        if (edge - video.currentTime > 0.15) {
+            video.currentTime = edge - 0.15;
+        }
+    });
+
+    video.addEventListener('canplay', () => {
+        report('canplay rs=' + video.readyState);
+        if (!hasPlayed) attemptPlay();
+    });
 
     video.addEventListener('playing', () => {
         hideStatus();
-        if (!hasPlayed) hasPlayed = true;
+        if (!hasPlayed) { hasPlayed = true; playAttemptPending = false; }
     });
 
     video.addEventListener('error', () => {
         const err = video.error;
-        report('video error: code=' + (err ? err.code : '?'));
+        report('video error: code=' + (err ? err.code : '?') + ' reinits=' + errorReinitCount);
+        errorReinitCount++;
+        if (errorReinitCount > 5) {
+            report('Too many error reinits — stopping');
+            showStatus('Playback error');
+            return;
+        }
+        if (lastInitSeg) {
+            setTimeout(() => reinitMSE(), 300 * errorReinitCount);
+        }
     });
 
     // ═══════════════════════════════════════════════════════════════
@@ -432,23 +508,33 @@
     function startLiveLoop() {
         if (liveTimer) clearInterval(liveTimer);
         liveTimer = setInterval(() => {
-            // Keep audio near live edge
-            if (audioEl && audioSB && audioSB.buffered.length > 0) {
-                const edge = audioSB.buffered.end(audioSB.buffered.length - 1);
-                const drift = edge - audioEl.currentTime;
-                if (drift > 1.0) {
-                    audioEl.currentTime = edge - 0.2;
-                }
-                if (audioEl.paused) audioEl.play().catch(() => {});
+            if (!sourceBuffer || sourceBuffer.buffered.length === 0) return;
+            if (video.paused && hasPlayed) video.play().catch(() => {});
 
-                // Trim old audio buffer
-                if (!audioSB.updating) {
-                    const s = audioSB.buffered.start(0);
-                    const rm = audioEl.currentTime - 3.0;
-                    if (rm > s + 0.5) {
-                        try { audioSB.remove(s, rm); } catch(_) {}
-                    }
+            const ct = video.currentTime;
+            const edge = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+            const drift = edge - ct;
+
+            if (drift > 0.5 && hasPlayed) {
+                video.currentTime = edge - 0.1;
+                seekCount++;
+            }
+
+            if (!sourceBuffer.updating && hasPlayed) {
+                const bufStart = sourceBuffer.buffered.start(0);
+                const removeEnd = ct - 2.0;
+                if (removeEnd > bufStart + 0.5) {
+                    try { sourceBuffer.remove(bufStart, removeEnd); } catch(_) {}
                 }
+            }
+
+            if (hasPlayed && sourceBuffer.buffered.length > 3) {
+                report('Fragmented buffer (' + sourceBuffer.buffered.length + ' ranges) — reinit');
+                reinitMSE();
+            }
+
+            if (hasPlayed && !video.paused && drift < 0.5) {
+                errorReinitCount = 0;
             }
         }, 200);
     }
@@ -457,39 +543,39 @@
         if (diagTimer) clearInterval(diagTimer);
         diagTimer = setInterval(() => {
             const elapsed = ((Date.now() - streamStartTime) / 1000).toFixed(1);
-            const iceState = pc ? pc.iceConnectionState : 'none';
+            const ct = video.currentTime.toFixed(2);
+            const paused = video.paused ? 'PAUSED' : 'playing';
+            const muted = video.muted ? 'muted' : 'unmuted';
 
-            let videoInfo = 'no-track';
-            if (video.srcObject) {
-                const vt = video.srcObject.getVideoTracks();
-                if (vt.length > 0) {
-                    const s = vt[0].getSettings ? vt[0].getSettings() : {};
-                    videoInfo = (s.width || '?') + 'x' + (s.height || '?')
-                        + '@' + (s.frameRate ? s.frameRate.toFixed(0) : '?') + 'fps';
-                }
+            let bufInfo = 'none';
+            if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+                const bs = sourceBuffer.buffered.start(0).toFixed(2);
+                const be = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1).toFixed(2);
+                bufInfo = bs + '-' + be + '(' + sourceBuffer.buffered.length + ')';
             }
 
             let dropInfo = '';
             if (video.getVideoPlaybackQuality) {
                 const q = video.getVideoPlaybackQuality();
-                dropInfo = ' drop=' + q.droppedVideoFrames + '/' + q.totalVideoFrames;
-            }
-
-            let audioInfo = 'none';
-            if (audioSB && audioSB.buffered.length > 0) {
-                const be = audioSB.buffered.end(audioSB.buffered.length - 1).toFixed(2);
-                const ct = audioEl ? audioEl.currentTime.toFixed(2) : '?';
-                audioInfo = 'ct=' + ct + ' edge=' + be;
+                const nd = q.droppedVideoFrames - lastDropped;
+                const nt = q.totalVideoFrames - lastTotal;
+                dropInfo = ' drop=' + q.droppedVideoFrames + '/' + q.totalVideoFrames
+                    + '(+' + nd + '/' + nt + ')';
+                lastDropped = q.droppedVideoFrames;
+                lastTotal = q.totalVideoFrames;
             }
 
             const kbps = streamStartTime > 0
                 ? ((totalBytes * 8) / ((Date.now() - streamStartTime) / 1000) / 1000).toFixed(0)
                 : '0';
 
-            report('DIAG t=' + elapsed + 's ice=' + iceState
-                + ' video=[' + videoInfo + ']' + dropInfo
-                + ' audio=[' + audioInfo + ']'
-                + ' frags=' + fragments + ' ' + kbps + 'kbps');
+            const iceState = pc ? pc.iceConnectionState : 'none';
+
+            report('DIAG t=' + elapsed + 's ct=' + ct + ' ' + paused + ' ' + muted
+                + ' buf=[' + bufInfo + '] q=' + queue.length
+                + ' frags=' + fragments + ' ' + kbps + 'kbps'
+                + ' seeks=' + seekCount + ' waits=' + waitCount + dropInfo
+                + ' ice=' + iceState);
         }, 5000);
     }
 
