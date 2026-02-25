@@ -291,6 +291,12 @@ function stopStream() {
 
 // ── Welcome Image ───────────────────────────────────────────
 function showWelcome(msg) {
+    // Stop stale WebRTC DIAG timer and close old peer connection
+    if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+    if (pc) {
+        try { pc.close(); } catch (e) {}
+        pc = null;
+    }
     // GoogleCastService sends field "imageUrl" (camelCase)
     var url = msg.imageUrl || msg.imageURL || '';
     if (url) {
