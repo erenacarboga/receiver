@@ -241,7 +241,7 @@ function handleOffer(sdp, sndParam) {
             if (!playStarted) {
                 playStarted = true;
 
-                // Brief delay for both tracks to register.
+                // Small delay so both tracks are attached before play.
                 setTimeout(function() {
                     var tracks = video.srcObject
                         ? video.srcObject.getTracks().length : 0;
@@ -269,7 +269,7 @@ function handleOffer(sdp, sndParam) {
                         }
                         showStatus('');
                     });
-                }, 50);
+                }, 150);
             } else {
                 var total = video.srcObject
                     ? video.srcObject.getTracks().length : 0;
