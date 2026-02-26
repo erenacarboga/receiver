@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <!--
-  receiver.html v11 — Chromecast Custom Receiver (WebRTC Video Track + Audio)
+  receiver.html v12 — Chromecast Custom Receiver (WebRTC Video Track + Audio)
 
   Architecture:
     Phone → WebRTC PeerConnection (video track / RTP) → This receiver
@@ -373,12 +373,18 @@ function stopStream() {
 
 // ── Welcome Screen (built-in HTML/CSS) ──────────────────────
 function showWelcome(msg) {
-    // Stop stale WebRTC DIAG timer and close old peer connection
-    if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+    // If a WebRTC session is active (or being set up), ignore
+    // stale SHOW_WELCOME from the welcome CastV2 — the video
+    // feed takes priority.  Without this guard a race between
+    // the welcome and mirroring CastV2 sessions can cause
+    // SHOW_WELCOME to arrive AFTER WEBRTC_OFFER, tearing down
+    // the PeerConnection and hiding the video.
     if (pc) {
-        try { pc.close(); } catch (e) {}
-        pc = null;
+        diag('showWelcome ignored — WebRTC session active');
+        return;
     }
+    // Stop stale DIAG timer
+    if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
     // Apply localised subtitle if provided by the phone
     if (msg.subtitle) {
         var sub = welc.querySelector('.subtitle');
@@ -491,8 +497,8 @@ function startDiagTimer() {
 var opts = new cast.framework.CastReceiverOptions();
 opts.disableIdleTimeout = true;
 ctx.start(opts);
-log('Receiver v11 ready (WebRTC Video Track + Audio)');
-diag('Receiver v11 loaded');
+log('Receiver v12 ready (WebRTC Video Track + Audio)');
+diag('Receiver v12 loaded');
 </script>
 </body>
 </html>
