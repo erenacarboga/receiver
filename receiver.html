@@ -97,6 +97,7 @@ var startTime    = 0;
 var diagTimer    = null;
 var senderID     = null;
 var soundEnabled = true;   // latest sound preference from phone
+var videoPlaying = false;  // true once video.play() succeeds
 
 // ── Helpers ─────────────────────────────────────────────────
 function log(m) { console.log('[RECV] ' + m); }
@@ -251,6 +252,7 @@ function handleOffer(sdp, sndParam) {
                     video.play().then(function() {
                         diag('PLAYING (tracks=' + tracks +
                              ' muted=' + video.muted + ')');
+                        videoPlaying = true;
                         showStatus('');
                     }).catch(function(e) {
                         log('play() error: ' + e);
@@ -297,6 +299,10 @@ function handleOffer(sdp, sndParam) {
             if (st === 'connected' || st === 'completed') {
                 showStatus('');
                 startDiagTimer();
+            } else if (videoPlaying) {
+                // Video is visible — never overlay status text.
+                // The last frame stays on screen; ICE will
+                // either recover or the phone will tear down.
             } else if (st === 'failed') {
                 showStatus('Connection failed');
             } else if (st === 'disconnected') {
@@ -361,6 +367,7 @@ function stopStream() {
         pc = null;
     }
     video.srcObject = null;
+    videoPlaying = false;
     showStatus('');
 }
 
@@ -379,6 +386,7 @@ function showWelcome(msg) {
     }
     video.srcObject = null;
     video.style.display = 'none';
+    videoPlaying = false;
     showStatus('');
 
     // Wait for logo image to load before revealing
