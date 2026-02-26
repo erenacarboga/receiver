@@ -18,7 +18,6 @@
     SET_SOUND     (phone→receiver) → mute/unmute
 -->
 <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@48,400,1,0" />
 <style>
 html, body {
     margin: 0; padding: 0;
@@ -35,21 +34,20 @@ video {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
     background: #000;
-    display: flex; flex-direction: column;
+    display: none; flex-direction: column;
     align-items: center; justify-content: center;
     gap: 28px;
     z-index: 5;
 }
 #welcome .logo {
     width: 120px; height: 120px;
-    background: #141414;
-    border: 1.5px solid rgba(255,255,255,0.16);
     border-radius: 24px;
     display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
 }
-#welcome .logo .material-symbols-outlined {
-    font-size: 56px;
-    color: #fff;
+#welcome .logo img {
+    width: 100%; height: 100%;
+    object-fit: cover;
 }
 #welcome .title {
     font-size: 48px;
@@ -75,7 +73,7 @@ video {
 </head>
 <body>
 <div id="welcome">
-    <div class="logo"><span class="material-symbols-outlined">cast</span></div>
+    <div class="logo"><img src="data:image/webp;base64,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" alt="App Logo"/></div>
     <div class="title">Screen Mirroring</div>
     <div class="subtitle">Use the app to start casting</div>
 </div>
@@ -335,9 +333,17 @@ function showWelcome(msg) {
     }
     video.srcObject = null;
     video.style.display = 'none';
-    welc.style.display = 'flex';
     showStatus('');
-    diag('SHOW_WELCOME');
+
+    // Wait for logo image to load before revealing
+    var logo = welc.querySelector('.logo img');
+    if (logo && !logo.complete) {
+        logo.onload = function() { welc.style.display = 'flex'; diag('SHOW_WELCOME'); };
+        logo.onerror = function() { welc.style.display = 'flex'; diag('SHOW_WELCOME (logo err)'); };
+    } else {
+        welc.style.display = 'flex';
+        diag('SHOW_WELCOME');
+    }
 }
 
 // ── Diagnostics Timer (WebRTC Stats) ────────────────────────
