@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <!--
-  receiver.html v10 — Chromecast Custom Receiver (WebRTC Video Track)
+  receiver.html v11 — Chromecast Custom Receiver (WebRTC Video Track + Audio)
 
   Architecture:
     Phone → WebRTC PeerConnection (video track / RTP) → This receiver
@@ -92,10 +92,11 @@ var stat  = document.getElementById('status');
 
 var RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
 
-var pc        = null;
-var startTime = 0;
-var diagTimer = null;
-var senderID  = null;
+var pc           = null;
+var startTime    = 0;
+var diagTimer    = null;
+var senderID     = null;
+var soundEnabled = true;   // latest sound preference from phone
 
 // ── Helpers ─────────────────────────────────────────────────
 function log(m) { console.log('[RECV] ' + m); }
@@ -162,8 +163,9 @@ ctx.addCustomMessageListener(NS, function(event) {
             break;
 
         case 'SET_SOUND':
-            video.muted = !msg.enabled;
-            diag('Sound ' + (msg.enabled ? 'ON' : 'OFF'));
+            soundEnabled = !!msg.enabled;
+            video.muted = !soundEnabled;
+            diag('Sound ' + (soundEnabled ? 'ON' : 'OFF'));
             break;
 
         default:
@@ -173,8 +175,13 @@ ctx.addCustomMessageListener(NS, function(event) {
 });
 
 // ── WebRTC Offer → Answer ───────────────────────────────────
-function handleOffer(sdp, soundEnabled) {
+function handleOffer(sdp, sndParam) {
     diag('WEBRTC_OFFER received');
+
+    // Update global soundEnabled from offer if provided
+    if (sndParam !== undefined) {
+        soundEnabled = !!sndParam;
+    }
 
     // Check WebRTC support
     if (!RTC) {
@@ -199,37 +206,76 @@ function handleOffer(sdp, soundEnabled) {
         showStatus('Connecting…');
 
         // Apply sound setting from offer
-        if (soundEnabled !== undefined) {
-            video.muted = !soundEnabled;
-        }
+        video.muted = !soundEnabled;
 
-        diag('Starting WebRTC peer connection');
+        diag('Starting WebRTC peer connection (sound=' + (soundEnabled ? 'ON' : 'OFF') + ')');
 
         // Create PeerConnection — no STUN servers needed for same-LAN.
         // Removing STUN forces direct host candidates → <5ms RTT.
         pc = new RTC({ iceServers: [] });
 
         // ── Track arrives → play on <video> ──────────────
-        pc.ontrack = function(ev) {
-            diag('Track: ' + ev.track.kind);
+        // Both video and audio tracks share streamIds ["stream0"],
+        // so ev.streams[0] is the same MediaStream for both.
+        // We set srcObject ONCE and call play() ONCE to avoid
+        // the second play() call failing and muting via catch().
+        var playStarted = false;
 
-            if (ev.streams && ev.streams[0]) {
-                video.srcObject = ev.streams[0];
-            } else {
-                var ms = new MediaStream();
-                ms.addTrack(ev.track);
-                video.srcObject = ms;
+        pc.ontrack = function(ev) {
+            diag('Track: ' + ev.track.kind +
+                 ' (muted=' + video.muted + ')');
+
+            // Assign srcObject only once — subsequent tracks are
+            // already part of the same stream.
+            if (!video.srcObject) {
+                if (ev.streams && ev.streams[0]) {
+                    video.srcObject = ev.streams[0];
+                } else {
+                    video.srcObject = new MediaStream([ev.track]);
+                }
+            } else if (!ev.streams || !ev.streams[0]) {
+                // Standalone track → add to existing MediaStream
+                video.srcObject.addTrack(ev.track);
             }
 
-            video.play().then(function() {
-                diag('PLAYING');
-                showStatus('');
-            }).catch(function(e) {
-                log('play() error: ' + e);
-                video.muted = true;
-                video.play().catch(function() {});
-                showStatus('');
-            });
+            if (!playStarted) {
+                playStarted = true;
+
+                // Small delay so both tracks are attached before play.
+                setTimeout(function() {
+                    var tracks = video.srcObject
+                        ? video.srcObject.getTracks().length : 0;
+                    diag('play() tracks=' + tracks +
+                         ' muted=' + video.muted);
+
+                    video.play().then(function() {
+                        diag('PLAYING (tracks=' + tracks +
+                             ' muted=' + video.muted + ')');
+                        showStatus('');
+                    }).catch(function(e) {
+                        log('play() error: ' + e);
+                        // If sound is ON, try unmuted first, then
+                        // muted as absolute last resort.
+                        if (soundEnabled) {
+                            diag('play() failed with sound ON, retrying');
+                            video.play().catch(function() {
+                                diag('play() still failing, muted fallback');
+                                video.muted = true;
+                                video.play().catch(function() {});
+                            });
+                        } else {
+                            video.muted = true;
+                            video.play().catch(function() {});
+                        }
+                        showStatus('');
+                    });
+                }, 150);
+            } else {
+                var total = video.srcObject
+                    ? video.srcObject.getTracks().length : 0;
+                diag('Track added (' + ev.track.kind +
+                     '), total=' + total);
+            }
         };
 
         // ── ICE candidates → send to phone ───────────────
@@ -360,6 +406,7 @@ function startDiagTimer() {
             var codec = '';
             var localType = '', remoteType = '', localAddr = '', remoteAddr = '';
             var selectedPairId = '';
+            var aBytes = 0, aPackets = 0, aCodec = '', aJitter = 0;
 
             // First pass: find the selected candidate-pair
             stats.forEach(function(r) {
@@ -396,6 +443,16 @@ function startDiagTimer() {
                         }
                     }
                 }
+                // Audio inbound stats
+                if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+                    aBytes   = r.bytesReceived || 0;
+                    aPackets = r.packetsReceived || 0;
+                    aJitter  = r.jitter || 0;
+                    if (r.codecId) {
+                        var ac = stats.get(r.codecId);
+                        if (ac && ac.mimeType) aCodec = ac.mimeType;
+                    }
+                }
             });
 
             var d = 't=' + elapsed + 's' +
@@ -410,7 +467,10 @@ function startDiagTimer() {
                 (codec ? ' codec=' + codec : '') +
                 ' pair=' + localType + '→' + remoteType +
                 ' local=' + localAddr +
-                ' remote=' + remoteAddr;
+                ' remote=' + remoteAddr +
+                ' aud=' + aPackets + 'pkt/' + aBytes + 'B' +
+                (aCodec ? ' acodec=' + aCodec : '') +
+                ' muted=' + video.muted;
 
             send({ type: 'DIAG', data: d });
         }).catch(function(e) {
@@ -423,8 +483,8 @@ function startDiagTimer() {
 var opts = new cast.framework.CastReceiverOptions();
 opts.disableIdleTimeout = true;
 ctx.start(opts);
-log('Receiver v10 ready (WebRTC Video Track)');
-diag('Receiver v10 loaded');
+log('Receiver v11 ready (WebRTC Video Track + Audio)');
+diag('Receiver v11 loaded');
 </script>
 </body>
 </html>
