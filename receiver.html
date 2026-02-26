@@ -34,7 +34,7 @@ video {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
     background: #000;
-    display: none; flex-direction: column;
+    display: flex; flex-direction: column;
     align-items: center; justify-content: center;
     gap: 28px;
     z-index: 5;
@@ -373,15 +373,22 @@ function stopStream() {
 
 // ── Welcome Screen (built-in HTML/CSS) ──────────────────────
 function showWelcome(msg) {
-    // If a WebRTC session is active (or being set up), ignore
-    // stale SHOW_WELCOME from the welcome CastV2 — the video
-    // feed takes priority.  Without this guard a race between
-    // the welcome and mirroring CastV2 sessions can cause
-    // SHOW_WELCOME to arrive AFTER WEBRTC_OFFER, tearing down
-    // the PeerConnection and hiding the video.
+    // If a WebRTC session is actively connecting or streaming,
+    // ignore stale SHOW_WELCOME from the welcome CastV2 session.
+    // Without this guard, SHOW_WELCOME can race with WEBRTC_OFFER
+    // and tear down the PeerConnection.  We only allow
+    // SHOW_WELCOME through when ICE is dead (disconnected/failed/
+    // closed) — meaning mirroring has ended.
     if (pc) {
-        diag('showWelcome ignored — WebRTC session active');
-        return;
+        var iceState = pc.iceConnectionState;
+        if (iceState === 'new' || iceState === 'checking' ||
+            iceState === 'connected' || iceState === 'completed') {
+            diag('showWelcome IGNORED — WebRTC active (ICE=' + iceState + ')');
+            return;
+        }
+        // ICE is disconnected/failed/closed → session over, tear down
+        diag('showWelcome: cleaning up stale PC (ICE=' + iceState + ')');
+        stopStream();
     }
     // Stop stale DIAG timer
     if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
