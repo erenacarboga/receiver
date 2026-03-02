@@ -3,16 +3,17 @@
 <head>
 <meta charset="utf-8">
 <!--
-  receiver.html v12 — Chromecast Custom Receiver (WebRTC Video Track + Audio)
+  receiver.html v13 — Chromecast Custom Receiver (WebRTC + MSE/WebSocket)
 
   Architecture:
-    Phone → WebRTC PeerConnection (video track / RTP) → This receiver
-    pc.ontrack → video.srcObject = stream   ← NO MSE, NO SourceBuffer!
+    Screen Mirroring: Phone → WebRTC PeerConnection (video track / RTP) → This receiver
+    Camera Cast:      Phone → WebSocket (fMP4 fragments) → MSE SourceBuffer → <video>
 
   Signaling:
     WEBRTC_OFFER  (phone→receiver) → SDP offer
     WEBRTC_ANSWER (receiver→phone) → SDP answer
     WEBRTC_ICE    (bidirectional)   → ICE candidates
+    START_STREAM  (phone→receiver) → connect to WebSocket, play fMP4 via MSE
     SHOW_WELCOME  (phone→receiver) → show built-in welcome screen
     STOP_STREAM   (phone→receiver) → tear down
     SET_SOUND     (phone→receiver) → mute/unmute
@@ -99,6 +100,12 @@ var senderID     = null;
 var soundEnabled = true;   // latest sound preference from phone
 var videoPlaying = false;  // true once video.play() succeeds
 
+// MSE/WebSocket state (Camera Cast)
+var ws           = null;   // WebSocket connection to phone's camera server
+var mediaSource  = null;
+var sourceBuffer = null;
+var bufferQueue  = [];     // pending ArrayBuffers while SB is updating
+
 // ── Helpers ─────────────────────────────────────────────────
 function log(m) { console.log('[RECV] ' + m); }
 
@@ -152,6 +159,10 @@ ctx.addCustomMessageListener(NS, function(event) {
 
         case 'WEBRTC_ICE':
             handleIce(msg);
+            break;
+
+        case 'START_STREAM':
+            handleStartStream(msg.wsUrl, msg.soundEnabled);
             break;
 
         case 'STOP_STREAM':
@@ -362,13 +373,183 @@ function handleIce(msg) {
 // ── Stop / Cleanup ──────────────────────────────────────────
 function stopStream() {
     if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
+    // WebRTC cleanup
     if (pc) {
         try { pc.close(); } catch (e) {}
         pc = null;
     }
+    // WebSocket cleanup (Camera Cast)
+    if (ws) {
+        try { ws.close(); } catch (e) {}
+        ws = null;
+    }
+    // MSE cleanup
+    if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
+        try {
+            sourceBuffer.abort();
+            mediaSource.removeSourceBuffer(sourceBuffer);
+        } catch (e) {}
+    }
+    sourceBuffer = null;
+    bufferQueue = [];
+    if (mediaSource) {
+        if (video.src && video.src.startsWith('blob:')) {
+            try { URL.revokeObjectURL(video.src); } catch (e) {}
+        }
+        mediaSource = null;
+    }
     video.srcObject = null;
+    video.removeAttribute('src');
+    video.load();
     videoPlaying = false;
     showStatus('');
+}
+
+// ── MSE/WebSocket Stream (Camera Cast) ──────────────────────
+function handleStartStream(wsUrl, sndParam) {
+    diag('START_STREAM: ' + wsUrl);
+
+    if (!wsUrl) {
+        diag('START_STREAM: missing wsUrl');
+        return;
+    }
+
+    // Update sound preference
+    if (sndParam !== undefined) {
+        soundEnabled = !!sndParam;
+    }
+
+    // Tear down any previous session
+    stopStream();
+
+    startTime = Date.now();
+    welc.style.display = 'none';
+    video.style.display = 'block';
+    video.muted = !soundEnabled;
+    showStatus('Connecting…');
+
+    // Check MSE support
+    if (typeof MediaSource === 'undefined') {
+        diag('MediaSource NOT supported on this device');
+        showStatus('MSE not supported');
+        return;
+    }
+
+    mediaSource = new MediaSource();
+    video.src = URL.createObjectURL(mediaSource);
+
+    mediaSource.addEventListener('sourceopen', function() {
+        diag('MSE sourceopen');
+        try {
+            // H.264 High profile — matches kVTProfileLevel_H264_High_AutoLevel
+            // Use a broad codec string so Chromecast accepts any level.
+            sourceBuffer = mediaSource.addSourceBuffer(
+                'video/mp4; codecs="avc1.640029"'
+            );
+            sourceBuffer.mode = 'segments';
+            sourceBuffer.addEventListener('updateend', drainQueue);
+            sourceBuffer.addEventListener('error', function(e) {
+                diag('SourceBuffer error: ' + e);
+            });
+        } catch (e) {
+            diag('addSourceBuffer error: ' + e);
+            showStatus('Codec not supported');
+            return;
+        }
+
+        // Connect to the phone's WebSocket camera server
+        connectWSStream(wsUrl);
+    });
+}
+
+function connectWSStream(wsUrl) {
+    try {
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = function() {
+            diag('WS connected to camera server');
+            showStatus('');
+        };
+
+        ws.onmessage = function(ev) {
+            if (ev.data instanceof ArrayBuffer && sourceBuffer) {
+                bufferQueue.push(new Uint8Array(ev.data));
+                drainQueue();
+            }
+        };
+
+        ws.onerror = function() {
+            diag('WS error');
+            showStatus('Connection error');
+        };
+
+        ws.onclose = function() {
+            diag('WS closed');
+        };
+    } catch (e) {
+        diag('WS connect error: ' + e);
+        showStatus('Connection failed');
+    }
+}
+
+function drainQueue() {
+    if (!sourceBuffer || sourceBuffer.updating || bufferQueue.length === 0) {
+        return;
+    }
+    var chunk = bufferQueue.shift();
+    try {
+        sourceBuffer.appendBuffer(chunk);
+
+        // Start playback once we have data
+        if (!videoPlaying) {
+            video.play().then(function() {
+                videoPlaying = true;
+                diag('MSE PLAYING (muted=' + video.muted + ')');
+                showStatus('');
+            }).catch(function(e) {
+                log('MSE play() error: ' + e);
+                // Autoplay policy: try muted
+                video.muted = true;
+                video.play().then(function() {
+                    videoPlaying = true;
+                    diag('MSE PLAYING (muted fallback)');
+                    showStatus('');
+                }).catch(function() {});
+            });
+        }
+
+        // Keep buffer trim: remove data older than 4 seconds to avoid
+        // QuotaExceededError and keep latency low on Chromecast.
+        trimBuffer();
+    } catch (e) {
+        if (e.name === 'QuotaExceededError') {
+            diag('QuotaExceeded — trimming buffer');
+            try {
+                var buffered = sourceBuffer.buffered;
+                if (buffered.length > 0) {
+                    sourceBuffer.remove(buffered.start(0), buffered.end(0) - 2);
+                }
+            } catch (re) {}
+        } else {
+            diag('appendBuffer error: ' + e.name + ' ' + e.message);
+        }
+    }
+}
+
+function trimBuffer() {
+    if (!sourceBuffer || sourceBuffer.updating) return;
+    try {
+        var buffered = sourceBuffer.buffered;
+        if (buffered.length > 0) {
+            var end = buffered.end(buffered.length - 1);
+            var start = buffered.start(0);
+            // Keep at most 4 seconds of buffer for low latency
+            if (end - start > 4) {
+                sourceBuffer.remove(start, end - 3);
+            }
+        }
+    } catch (e) {}
 }
 
 // ── Welcome Screen (built-in HTML/CSS) ──────────────────────
@@ -389,6 +570,11 @@ function showWelcome(msg) {
         // ICE is disconnected/failed/closed → session over, tear down
         diag('showWelcome: cleaning up stale PC (ICE=' + iceState + ')');
         stopStream();
+    }
+    // If an MSE/WebSocket camera stream is active, ignore stale welcome
+    if (ws && ws.readyState <= WebSocket.OPEN) {
+        diag('showWelcome IGNORED — MSE/WS stream active');
+        return;
     }
     // Stop stale DIAG timer
     if (diagTimer) { clearInterval(diagTimer); diagTimer = null; }
@@ -504,8 +690,8 @@ function startDiagTimer() {
 var opts = new cast.framework.CastReceiverOptions();
 opts.disableIdleTimeout = true;
 ctx.start(opts);
-log('Receiver v12 ready (WebRTC Video Track + Audio)');
-diag('Receiver v12 loaded');
+log('Receiver v13 ready (WebRTC + MSE/WebSocket)');
+diag('Receiver v13 loaded');
 </script>
 </body>
 </html>
