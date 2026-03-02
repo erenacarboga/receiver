@@ -105,8 +105,6 @@ var ws           = null;   // WebSocket connection to phone's camera server
 var mediaSource  = null;
 var sourceBuffer = null;
 var bufferQueue  = [];     // pending ArrayBuffers while SB is updating
-var appendCount  = 0;
-var totalBytes   = 0;
 
 // ── Helpers ─────────────────────────────────────────────────
 function log(m) { console.log('[RECV] ' + m); }
@@ -394,8 +392,6 @@ function stopStream() {
     }
     sourceBuffer = null;
     bufferQueue = [];
-    appendCount = 0;
-    totalBytes = 0;
     if (mediaSource) {
         if (video.src && video.src.startsWith('blob:')) {
             try { URL.revokeObjectURL(video.src); } catch (e) {}
@@ -418,22 +414,23 @@ function handleStartStream(wsUrl, sndParam) {
         return;
     }
 
+    // Update sound preference
     if (sndParam !== undefined) {
         soundEnabled = !!sndParam;
     }
 
+    // Tear down any previous session
     stopStream();
 
     startTime = Date.now();
-    appendCount = 0;
-    totalBytes = 0;
     welc.style.display = 'none';
     video.style.display = 'block';
     video.muted = !soundEnabled;
     showStatus('Connecting…');
 
+    // Check MSE support
     if (typeof MediaSource === 'undefined') {
-        diag('MediaSource NOT supported');
+        diag('MediaSource NOT supported on this device');
         showStatus('MSE not supported');
         return;
     }
@@ -445,17 +442,14 @@ function handleStartStream(wsUrl, sndParam) {
         diag('MSE sourceopen');
         try {
             // H.264 High profile — matches kVTProfileLevel_H264_High_AutoLevel
+            // Use a broad codec string so Chromecast accepts any level.
             sourceBuffer = mediaSource.addSourceBuffer(
                 'video/mp4; codecs="avc1.640029"'
             );
-            // 'sequence' mode: auto-generate timestamps starting from 0.
-            // Without this, the keyframe sent on WS connect has a non-zero
-            // DTS (camera runtime offset) causing the video to stay black
-            // because currentTime=0 has no data.
-            sourceBuffer.mode = 'sequence';
-            sourceBuffer.addEventListener('updateend', onSBUpdateEnd);
+            sourceBuffer.mode = 'segments';
+            sourceBuffer.addEventListener('updateend', handleUpdateEnd);
             sourceBuffer.addEventListener('error', function(e) {
-                diag('SB error: ' + e);
+                diag('SourceBuffer error: ' + e);
             });
         } catch (e) {
             diag('addSourceBuffer error: ' + e);
@@ -463,6 +457,7 @@ function handleStartStream(wsUrl, sndParam) {
             return;
         }
 
+        // Connect to the phone's WebSocket camera server
         connectWSStream(wsUrl);
     });
 }
@@ -473,18 +468,14 @@ function connectWSStream(wsUrl) {
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = function() {
-            diag('WS connected');
-            showStatus('Buffering…');
+            diag('WS connected to camera server');
+            showStatus('');
         };
 
         ws.onmessage = function(ev) {
             if (ev.data instanceof ArrayBuffer && sourceBuffer) {
                 bufferQueue.push(new Uint8Array(ev.data));
-                appendNext();
-                // Try playing once we have init + at least one media segment
-                if (!videoPlaying && appendCount >= 2) {
-                    tryPlay();
-                }
+                drainQueue();
             }
         };
 
@@ -493,8 +484,8 @@ function connectWSStream(wsUrl) {
             showStatus('Connection error');
         };
 
-        ws.onclose = function(e) {
-            diag('WS closed code=' + (e ? e.code : '?'));
+        ws.onclose = function() {
+            diag('WS closed');
         };
     } catch (e) {
         diag('WS connect error: ' + e);
@@ -502,108 +493,85 @@ function connectWSStream(wsUrl) {
     }
 }
 
-/** Append the next queued chunk to the SourceBuffer (if idle). */
-function appendNext() {
+function drainQueue() {
     if (!sourceBuffer || sourceBuffer.updating || bufferQueue.length === 0) {
         return;
     }
     var chunk = bufferQueue.shift();
     try {
         sourceBuffer.appendBuffer(chunk);
-        appendCount++;
-        totalBytes += chunk.byteLength;
-
-        if (appendCount === 1 || appendCount === 3 || appendCount % 150 === 0) {
-            diag('append #' + appendCount + ' +' + chunk.byteLength +
-                 'B total=' + totalBytes + ' buf=' + getBufferedInfo());
-        }
     } catch (e) {
         if (e.name === 'QuotaExceededError') {
-            diag('QuotaExceeded — force trim');
-            bufferQueue.unshift(chunk);
+            diag('QuotaExceeded — trimming buffer');
             try {
-                var b = sourceBuffer.buffered;
-                if (b.length > 0) {
-                    sourceBuffer.remove(b.start(0), b.end(0) - 1);
+                var buffered = sourceBuffer.buffered;
+                if (buffered.length > 0) {
+                    sourceBuffer.remove(buffered.start(0), buffered.end(0) - 2);
                 }
             } catch (re) {}
         } else {
-            diag('appendBuffer ERR: ' + e.name + ' ' + e.message);
+            diag('appendBuffer error: ' + e.name + ' ' + e.message);
         }
     }
 }
 
-/** Called after every SourceBuffer async operation completes. */
-function onSBUpdateEnd() {
-    // Drain queue first (next append)
-    if (bufferQueue.length > 0) {
-        appendNext();
-        return;
-    }
-    // Nothing queued — trim old data for low latency
-    trimBuffer();
-}
-
-function tryPlay() {
-    if (videoPlaying) return;
-    var b = video.buffered;
-    if (b.length === 0) return;
-
-    video.play().then(function() {
-        videoPlaying = true;
-        diag('MSE PLAYING muted=' + video.muted + ' buf=' + getBufferedInfo());
-        showStatus('');
-        startMSEDiagTimer();
-    }).catch(function(e) {
-        log('play() err: ' + e);
-        video.muted = true;
-        video.play().then(function() {
-            videoPlaying = true;
-            diag('MSE PLAYING (muted fallback)');
-            showStatus('');
-            startMSEDiagTimer();
-        }).catch(function(e2) {
-            diag('play() FAILED: ' + e2);
-        });
-    });
-}
-
-function getBufferedInfo() {
+function handleUpdateEnd() {
+    if (!sourceBuffer) return;
+    
+    // Attempt playback if we have buffered data
     try {
-        var b = video.buffered;
-        if (b.length === 0) return 'none';
-        return b.start(0).toFixed(2) + '-' + b.end(b.length - 1).toFixed(2) + 's';
-    } catch (e) { return 'err'; }
+        var buffered = sourceBuffer.buffered;
+        if (buffered.length > 0) {
+            var start = buffered.start(0);
+            var end = buffered.end(buffered.length - 1);
+            
+            // If currentTime is far behind the buffer (e.g. from joining a live stream late), jump to live edge
+            if (video.currentTime < start || video.currentTime < end - 3) {
+                diag('MSE jumping from ' + video.currentTime.toFixed(1) + ' to live edge: ' + start.toFixed(1));
+                video.currentTime = start;
+            }
+
+            if (!videoPlaying && (end - start > 0.1)) {
+                video.play().then(function() {
+                    videoPlaying = true;
+                    diag('MSE PLAYING (muted=' + video.muted + ')');
+                    showStatus('');
+                }).catch(function(e) {
+                    log('MSE play() error: ' + e);
+                    // Autoplay policy: try muted
+                    video.muted = true;
+                    video.play().then(function() {
+                        videoPlaying = true;
+                        diag('MSE PLAYING (muted fallback)');
+                        showStatus('');
+                    }).catch(function(err) {
+                        diag('MSE play fallback failed: ' + err);
+                    });
+                });
+            }
+        }
+    } catch (e) {}
+
+    // Keep buffer trimmed
+    trimBuffer();
+    
+    // Process next chunk
+    drainQueue();
 }
 
 function trimBuffer() {
     if (!sourceBuffer || sourceBuffer.updating) return;
     try {
-        var b = sourceBuffer.buffered;
-        if (b.length > 0) {
-            var end = b.end(b.length - 1);
-            var start = b.start(0);
+        var buffered = sourceBuffer.buffered;
+        if (buffered.length > 0) {
+            var end = buffered.end(buffered.length - 1);
+            var start = buffered.start(0);
+            // Keep at most 4 seconds of buffer for low latency
             if (end - start > 4) {
                 sourceBuffer.remove(start, end - 3);
             }
         }
     } catch (e) {}
-}
-
-function startMSEDiagTimer() {
-    if (diagTimer) clearInterval(diagTimer);
-    diagTimer = setInterval(function() {
-        var elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        var d = 't=' + elapsed + 's' +
-            ' appends=' + appendCount +
-            ' bytes=' + totalBytes +
-            ' buf=' + getBufferedInfo() +
-            ' muted=' + video.muted +
-            ' paused=' + video.paused +
-            ' readyState=' + video.readyState +
-            ' queue=' + bufferQueue.length;
-        send({ type: 'DIAG', data: d });
-    }, 5000);
 }
 
 // ── Welcome Screen (built-in HTML/CSS) ──────────────────────
