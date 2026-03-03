@@ -203,7 +203,10 @@ function handleOffer(sdp, sndParam) {
 
         startTime = Date.now();
         welc.style.display = 'none';
+        welc.style.visibility = 'hidden';
+        welc.style.opacity = '0';
         video.style.display = 'block';
+        video.style.visibility = 'visible';
         showStatus('Connecting…');
 
         // Apply sound setting from offer
@@ -366,7 +369,12 @@ function stopStream() {
         try { pc.close(); } catch (e) {}
         pc = null;
     }
+    try { video.pause(); } catch (e) {}
     video.srcObject = null;
+    try {
+        video.removeAttribute('src');
+        video.load();
+    } catch (e) {}
     videoPlaying = false;
     showStatus('');
 }
@@ -398,18 +406,35 @@ function showWelcome(msg) {
         if (sub) sub.textContent = msg.subtitle;
     }
     video.srcObject = null;
+    try { video.pause(); } catch (e) {}
+    try {
+        video.removeAttribute('src');
+        video.load();
+    } catch (e) {}
     video.style.display = 'none';
+    video.style.visibility = 'hidden';
     videoPlaying = false;
     showStatus('');
 
-    // Wait for logo image to load before revealing
+    // Force welcome layer above any stale video compositor layer.
+    welc.style.zIndex = '2147483647';
+    welc.style.display = 'flex';
+    welc.style.visibility = 'visible';
+    welc.style.opacity = '1';
+    void welc.offsetHeight;
+
+    function ackWelcome(text) {
+        diag(text);
+        send({ type: 'WELCOME_SHOWN' });
+    }
+
+    // Ensure logo decode does not block visibility.
     var logo = welc.querySelector('.logo img');
     if (logo && !logo.complete) {
-        logo.onload = function() { welc.style.display = 'flex'; diag('SHOW_WELCOME'); };
-        logo.onerror = function() { welc.style.display = 'flex'; diag('SHOW_WELCOME (logo err)'); };
+        logo.onload = function() { ackWelcome('SHOW_WELCOME'); };
+        logo.onerror = function() { ackWelcome('SHOW_WELCOME (logo err)'); };
     } else {
-        welc.style.display = 'flex';
-        diag('SHOW_WELCOME');
+        ackWelcome('SHOW_WELCOME');
     }
 }
 
