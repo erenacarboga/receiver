@@ -18,6 +18,7 @@
     SET_SOUND     (phone→receiver) → mute/unmute
 -->
 <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script src="//cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 <style>
 html, body {
     margin: 0; padding: 0;
@@ -98,6 +99,7 @@ var diagTimer    = null;
 var senderID     = null;
 var soundEnabled = true;   // latest sound preference from phone
 var videoPlaying = false;  // true once video.play() succeeds
+var hls          = null;   // hls.js instance for IPTV / HLS playback
 
 // ── Helpers ─────────────────────────────────────────────────
 function log(m) { console.log('[RECV] ' + m); }
@@ -167,6 +169,10 @@ ctx.addCustomMessageListener(NS, function(event) {
             soundEnabled = !!msg.enabled;
             video.muted = !soundEnabled;
             diag('Sound ' + (soundEnabled ? 'ON' : 'OFF'));
+            break;
+
+        case 'PLAY_HLS':
+            handlePlayHLS(msg);
             break;
 
         default:
@@ -366,9 +372,131 @@ function stopStream() {
         try { pc.close(); } catch (e) {}
         pc = null;
     }
+    if (hls) {
+        try { hls.destroy(); } catch (e) {}
+        hls = null;
+    }
+    try { video.pause(); } catch (e) {}
+    video.removeAttribute('src');
     video.srcObject = null;
+    try { video.load(); } catch (e) {}
     videoPlaying = false;
     showStatus('');
+}
+
+// ── HLS Playback (IPTV) ─────────────────────────────────────
+function handlePlayHLS(msg) {
+    var url = msg.hlsUrl || msg.url;
+    if (!url) {
+        diag('PLAY_HLS: missing hlsUrl');
+        return;
+    }
+
+    if (msg.soundEnabled !== undefined) {
+        soundEnabled = !!msg.soundEnabled;
+    }
+
+    diag('PLAY_HLS received: ' + url.substring(0, 80));
+
+    // Tear down any previous session (WebRTC or HLS)
+    stopStream();
+
+    welc.style.display = 'none';
+    video.style.display = 'block';
+    video.muted = !soundEnabled;
+    video.autoplay = true;
+    showStatus('Loading…');
+    startTime = Date.now();
+
+    // Safari / native HLS path (Chromecast's embedded webview supports native HLS)
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        diag('Using native HLS playback');
+        video.src = url;
+        video.addEventListener('loadedmetadata', function onLoaded() {
+            video.removeEventListener('loadedmetadata', onLoaded);
+            video.play().then(function() {
+                diag('HLS PLAYING (native)');
+                videoPlaying = true;
+                showStatus('');
+            }).catch(function(e) {
+                diag('native HLS play() error: ' + e);
+                // Fall back to hls.js if native fails
+                playWithHlsJs(url);
+            });
+        });
+        video.addEventListener('error', function onErr() {
+            video.removeEventListener('error', onErr);
+            diag('native HLS error, trying hls.js');
+            playWithHlsJs(url);
+        }, { once: true });
+        return;
+    }
+
+    playWithHlsJs(url);
+}
+
+function playWithHlsJs(url) {
+    if (typeof Hls === 'undefined' || !Hls.isSupported()) {
+        diag('hls.js not supported on this receiver');
+        showStatus('HLS not supported');
+        return;
+    }
+
+    diag('Using hls.js playback');
+    hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        liveDurationInfinity: true,
+        backBufferLength: 30,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        manifestLoadingTimeOut: 15000,
+        manifestLoadingMaxRetry: 4,
+        levelLoadingTimeOut: 15000,
+        fragLoadingTimeOut: 20000
+    });
+
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MEDIA_ATTACHED, function() {
+        hls.loadSource(url);
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, function(evt, data) {
+        diag('HLS manifest parsed, ' + (data.levels || []).length + ' levels');
+        video.play().then(function() {
+            diag('HLS PLAYING (hls.js)');
+            videoPlaying = true;
+            showStatus('');
+        }).catch(function(e) {
+            diag('hls.js play() error: ' + e + ', retry muted');
+            video.muted = true;
+            video.play().catch(function(e2) {
+                diag('hls.js play() still failing: ' + e2);
+            });
+        });
+    });
+
+    hls.on(Hls.Events.ERROR, function(evt, data) {
+        diag('HLS error: type=' + data.type + ' details=' + data.details + ' fatal=' + data.fatal);
+        if (!data.fatal) return;
+        switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+                diag('Fatal network error, retry manifest');
+                hls.startLoad();
+                break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+                diag('Fatal media error, recover');
+                hls.recoverMediaError();
+                break;
+            default:
+                diag('Unrecoverable HLS error, destroying');
+                try { hls.destroy(); } catch (e) {}
+                hls = null;
+                showStatus('Stream error');
+                break;
+        }
+    });
 }
 
 // ── Welcome Screen (built-in HTML/CSS) ──────────────────────
@@ -388,6 +516,11 @@ function showWelcome(msg) {
         }
         // ICE is disconnected/failed/closed → session over, tear down
         diag('showWelcome: cleaning up stale PC (ICE=' + iceState + ')');
+        stopStream();
+    }
+    // If HLS is actively playing, tear it down so welcome can take over
+    if (hls) {
+        diag('showWelcome: tearing down active HLS');
         stopStream();
     }
     // Stop stale DIAG timer
@@ -504,8 +637,8 @@ function startDiagTimer() {
 var opts = new cast.framework.CastReceiverOptions();
 opts.disableIdleTimeout = true;
 ctx.start(opts);
-log('Receiver v12 ready (WebRTC Video Track + Audio)');
-diag('Receiver v12 loaded');
+log('Receiver v13 ready (WebRTC + HLS via hls.js)');
+diag('Receiver v13 loaded');
 </script>
 </body>
 </html>
